@@ -85,6 +85,17 @@ Logout, password changes/resets, role changes, and account deactivation invalida
 
 Transaction and payment data use typed JSON endpoints. Optional JPG/PNG proofs are uploaded separately with `multipart/form-data` to the relevant `/proof` endpoint. Maximum file size is 5 MB. Upload and replacement are synchronous; a newly uploaded object is deleted if database persistence fails, and replacement cleanup is best-effort after commit.
 
+## Cash on hand backfill
+
+`operational_cashflow_balances` keeps the running `cash_on_hand` balance, updated automatically on every operational cashflow transaction. Cashflows that existed before that table was introduced are not included until you run the backfill once after `alembic upgrade head`:
+
+```bash
+python -m app.scripts.backfill_cash_on_hand --dry-run   # print the recalculated balance only
+python -m app.scripts.backfill_cash_on_hand             # save it
+```
+
+This is a manual data command, not an Alembic migration. It recalculates the balance from all of `operational_cashflows` (paid `MAIN_ACCOUNT_TOPUP` adds `amount_idr`; any other type that is `PAID` or `PARTIALLY_PAID` subtracts `amount_idr`) and overwrites the stored amount. It is idempotent, so it can be re-run at any time, for example to repair drift after manual database edits. It takes the same lock as cashflow writes, so it is safe while the API is running. It uses `DATABASE_URL` from the environment or `.env`.
+
 ## Tests and checks
 
 Set `DATABASE_URL` to a disposable PostgreSQL database whose name ends in `_test`. Tests refuse other database names.

@@ -30,6 +30,7 @@ from app.db.models import (
     RevenueTransferDetail,
     User,
 )
+from app.features.cash_balance_service import sync_cash_on_hand
 from app.features.common import audit, model_snapshot, now_utc, today_local
 from app.features.farm_service import lock_balances
 
@@ -218,6 +219,7 @@ def save_operational(
         before=before,
         reason=reason,
     )
+    sync_cash_on_hand(db, before, row)
     return row
 
 
@@ -305,6 +307,7 @@ def pay_operational(
         before=before,
         after=model_snapshot(row) | {"payment_amount_idr": str(value), "payment_date": paid_date.isoformat()},
     )
+    sync_cash_on_hand(db, before, row)
     return row
 
 
@@ -329,6 +332,7 @@ def void_operational_payment(
     payment.voided_at, payment.voided_by, payment.void_reason = now_utc(), actor.id, reason
     sync_payment_status(row)
     audit(db, row, "cashflow_payment_voided", actor, before=before, reason=reason)
+    sync_cash_on_hand(db, before, row)
     return row
 
 

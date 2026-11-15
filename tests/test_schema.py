@@ -27,6 +27,7 @@ def test_schema_contains_only_retained_tables() -> None:
         "operational_cashflow_livestock_purchase_details",
         "operational_cashflow_bank_admin_details",
         "operational_cashflow_payments",
+        "operational_cashflow_balances",
         "revenues",
         "revenue_egg_details",
         "revenue_fish_details",

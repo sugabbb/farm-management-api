@@ -27,6 +27,7 @@ from app.db.models import (
     RevenuePayment,
     RevenueTransferDetail,
 )
+from app.features.cash_balance_service import cash_on_hand
 from app.features.common import actor_name, audit, model_snapshot, now_utc
 from app.features.finance_schemas import (
     Decision,
@@ -249,6 +250,17 @@ def operational_list(
         .limit(page.per_page)
     ).all()
     return {"data": [operational_out(db, row) for row in rows], "meta": page.meta(total)}
+
+
+@router.get("/operational-cashflows/cash-on-hand")
+def operational_cash_on_hand(_: ActiveUser, db: DbSession) -> dict[str, object]:
+    balance = cash_on_hand(db)
+    return {
+        "data": {
+            "amount": decimal_string(balance.amount, 0),
+            "updated_at": balance.updated_at.isoformat(),
+        }
+    }
 
 
 @router.get("/operational-cashflows/{cashflow_id}")

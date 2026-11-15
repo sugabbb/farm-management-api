@@ -1,3 +1,4 @@
+import uuid
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
@@ -16,9 +17,10 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin
@@ -351,6 +353,19 @@ class OperationalCashflowPayment(TimestampMixin, Base):
     voided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     voided_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
     void_reason: Mapped[str | None] = mapped_column(Text)
+
+
+class OperationalCashflowBalance(Base):
+    __tablename__ = "operational_cashflow_balances"
+    __table_args__ = (CheckConstraint("type IN ('cash_on_hand')", name="type"),)
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    type: Mapped[str] = mapped_column(String(30), unique=True, index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"), server_default="0")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class Revenue(TimestampMixin, Base):
