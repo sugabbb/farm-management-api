@@ -30,9 +30,10 @@ from app.db.models import (
     RevenueTransferDetail,
     User,
 )
-from app.features.cash_balance_service import sync_cash_on_hand
+from app.features.cash_balance_service import CashflowState, sync_balances
 from app.features.common import audit, model_snapshot, now_utc, today_local
 from app.features.farm_service import lock_balances
+from app.features.main_cash_account_service import RevenueState, enqueue_from_cashflow, enqueue_from_revenue
 
 OP_DETAIL_MODELS = (
     OperationalCashflowSalaryDetail,
@@ -138,6 +139,7 @@ def save_operational(
         if not correction and row.approval_status == "SUBMITTED":
             raise conflict("TRANSACTION_LOCKED", "A submitted transaction cannot be edited.")
     before = model_snapshot(row) if row else None
+    balances_before = CashflowState.of(row) if row else None
     cashflow_type = data["cashflow_type"]
     direction = "INFLOW" if cashflow_type == "MAIN_ACCOUNT_TOPUP" else "OUTFLOW"
     if row and row.direction != direction:
@@ -211,23 +213,20 @@ def save_operational(
         )
     elif row.payments:
         sync_payment_status(row)
-    audit(
-        db,
-        row,
-        "cashflow_corrected" if correction else ("cashflow_updated" if before else "cashflow_created"),
-        actor,
-        before=before,
-        reason=reason,
-    )
-    sync_cash_on_hand(db, before, row)
+    action = "cashflow_corrected" if correction else ("cashflow_updated" if before else "cashflow_created")
+    audit(db, row, action, actor, before=before, reason=reason)
+    sync_balances(db, balances_before, row)
+    enqueue_from_cashflow(db, balances_before, row, action)
     return row
 
 
 def submit_operational(db: Session, row: OperationalCashflow, actor: User) -> OperationalCashflow:
+    lock_balances(db)
     row = db.scalar(select(OperationalCashflow).where(OperationalCashflow.id == row.id).with_for_update())
     if row.direction != "OUTFLOW" or row.approval_status not in ("DRAFT", "REJECTED"):
         raise conflict("INVALID_STATE", "Cashflow cannot be submitted in its current state.")
     before = model_snapshot(row)
+    balances_before = CashflowState.of(row)
     row.approval_status, row.submitted_by, row.submitted_at, row.rejection_reason = (
         "SUBMITTED",
         actor.id,
@@ -235,16 +234,19 @@ def submit_operational(db: Session, row: OperationalCashflow, actor: User) -> Op
         None,
     )
     audit(db, row, "cashflow_submitted", actor, before=before)
+    sync_balances(db, balances_before, row)
     return row
 
 
 def decide_operational(
     db: Session, row: OperationalCashflow, actor: User, decision: str, reason: str | None
 ) -> OperationalCashflow:
+    lock_balances(db)
     row = db.scalar(select(OperationalCashflow).where(OperationalCashflow.id == row.id).with_for_update())
     if row.direction != "OUTFLOW" or row.approval_status != "SUBMITTED":
         raise conflict("INVALID_STATE", "Only a submitted outflow can be decided.")
     before = model_snapshot(row)
+    balances_before = CashflowState.of(row)
     if decision == "APPROVED":
         row.approval_status, row.approved_by, row.approved_at = "APPROVED", actor.id, now_utc()
         row.rejected_by = row.rejected_at = row.rejection_reason = None
@@ -257,6 +259,7 @@ def decide_operational(
         )
         row.approved_by = row.approved_at = None
     audit(db, row, decision.lower(), actor, before=before, reason=reason)
+    sync_balances(db, balances_before, row)
     return row
 
 
@@ -286,6 +289,7 @@ def pay_operational(
     if row.payment_status == "PAID":
         return row
     before = model_snapshot(row)
+    balances_before = CashflowState.of(row)
     value = payment_amount(mode, amount, remaining(row))
     db.add(
         OperationalCashflowPayment(
@@ -307,7 +311,7 @@ def pay_operational(
         before=before,
         after=model_snapshot(row) | {"payment_amount_idr": str(value), "payment_date": paid_date.isoformat()},
     )
-    sync_cash_on_hand(db, before, row)
+    sync_balances(db, balances_before, row)
     return row
 
 
@@ -329,10 +333,11 @@ def void_operational_payment(
     if payment.voided_at:
         return row
     before = model_snapshot(row)
+    balances_before = CashflowState.of(row)
     payment.voided_at, payment.voided_by, payment.void_reason = now_utc(), actor.id, reason
     sync_payment_status(row)
     audit(db, row, "cashflow_payment_voided", actor, before=before, reason=reason)
-    sync_cash_on_hand(db, before, row)
+    sync_balances(db, balances_before, row)
     return row
 
 
@@ -367,6 +372,7 @@ def save_revenue(
         if not correction and row.approval_status == "SUBMITTED":
             raise conflict("TRANSACTION_LOCKED", "A submitted transaction cannot be edited.")
     before = model_snapshot(row) if row else None
+    main_account_before = RevenueState.of(row) if row else None
     revenue_type = data["revenue_type"]
     direction = "OUTFLOW" if revenue_type == "MAIN_ACCOUNT_TRANSFER" else "INFLOW"
     if row and row.direction != direction:
@@ -455,14 +461,9 @@ def save_revenue(
         db.add(RevenueOtherDetail(revenue_id=row.id, notes=details.get("notes")))
     if row.payments and payment_method == "CASH":
         sync_payment_status(row)
-    audit(
-        db,
-        row,
-        "revenue_corrected" if correction else ("revenue_updated" if before else "revenue_created"),
-        actor,
-        before=before,
-        reason=reason,
-    )
+    action = "revenue_corrected" if correction else ("revenue_updated" if before else "revenue_created")
+    audit(db, row, action, actor, before=before, reason=reason)
+    enqueue_from_revenue(db, main_account_before, row, action)
     return row
 
 
@@ -564,6 +565,7 @@ def decide_revenue(
     if row.approval_status != "SUBMITTED" or (not direct and row.direction != "OUTFLOW"):
         raise conflict("INVALID_STATE", "Only a submitted transfer can be decided.")
     before = model_snapshot(row)
+    main_account_before = RevenueState.of(row)
     if decision == "REJECTED":
         row.approval_status, row.rejected_at, row.rejected_by, row.rejection_reason = (
             "REJECTED",
@@ -585,7 +587,9 @@ def decide_revenue(
     row.approval_status, row.approved_at, row.approved_by = "APPROVED", now_utc(), actor.id
     row.rejected_at = row.rejected_by = row.rejection_reason = None
     row.payment_status, row.paid_at, row.paid_by = "PAID", at_start(paid_date), actor.id
-    audit(db, row, "direct_transfer_approved" if direct else "transfer_approved", actor, before=before)
+    action = "direct_transfer_approved" if direct else "transfer_approved"
+    audit(db, row, action, actor, before=before)
+    enqueue_from_revenue(db, main_account_before, row, action)
     return row
 
 

@@ -2,7 +2,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, File, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, File, Query, UploadFile, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
@@ -52,6 +52,7 @@ from app.features.finance_service import (
     void_operational_payment,
     void_revenue_payment,
 )
+from app.features.main_cash_account_events import drain_in_background
 from app.integrations.proofs import proof_storage
 
 router = APIRouter(tags=["Finance"])
@@ -272,27 +273,36 @@ def operational_get(cashflow_id: int, _: ActiveUser, db: DbSession) -> dict[str,
 
 
 @router.post("/operational-cashflows", status_code=status.HTTP_201_CREATED)
-def operational_create(payload: OperationalInput, actor: ActiveUser, db: DbSession) -> dict[str, object]:
+def operational_create(
+    payload: OperationalInput, actor: ActiveUser, db: DbSession, background_tasks: BackgroundTasks
+) -> dict[str, object]:
     row = save_operational(db, payload.model_dump(), actor)
     db.commit()
+    # Main cash account posting happens after the response is sent (see main_cash_account_events).
+    background_tasks.add_task(drain_in_background)
     return operational_get(row.id, actor, db)
 
 
 @router.patch("/operational-cashflows/{cashflow_id}")
 def operational_update(
-    cashflow_id: int, payload: OperationalInput, actor: ActiveUser, db: DbSession
+    cashflow_id: int, payload: OperationalInput, actor: ActiveUser, db: DbSession, background_tasks: BackgroundTasks
 ) -> dict[str, object]:
     row = db.get(OperationalCashflow, cashflow_id)
     if not row:
         raise not_found("Operational cashflow")
     row = save_operational(db, payload.model_dump(), actor, row)
     db.commit()
+    background_tasks.add_task(drain_in_background)
     return operational_get(row.id, actor, db)
 
 
 @router.post("/operational-cashflows/{cashflow_id}/correction")
 def operational_correct(
-    cashflow_id: int, payload: OperationalCorrection, actor: Superadmin, db: DbSession
+    cashflow_id: int,
+    payload: OperationalCorrection,
+    actor: Superadmin,
+    db: DbSession,
+    background_tasks: BackgroundTasks,
 ) -> dict[str, object]:
     row = db.get(OperationalCashflow, cashflow_id)
     if not row:
@@ -301,6 +311,7 @@ def operational_correct(
         db, payload.transaction.model_dump(), actor, row, correction=True, reason=payload.correction_reason
     )
     db.commit()
+    background_tasks.add_task(drain_in_background)
     return operational_get(row.id, actor, db)
 
 
@@ -411,24 +422,32 @@ def revenue_get(revenue_id: int, _: ActiveUser, db: DbSession) -> dict[str, obje
 
 
 @router.post("/revenues", status_code=status.HTTP_201_CREATED)
-def revenue_create(payload: RevenueInput, actor: ActiveUser, db: DbSession) -> dict[str, object]:
+def revenue_create(
+    payload: RevenueInput, actor: ActiveUser, db: DbSession, background_tasks: BackgroundTasks
+) -> dict[str, object]:
     row = save_revenue(db, payload.model_dump(), actor)
     db.commit()
+    background_tasks.add_task(drain_in_background)
     return revenue_get(row.id, actor, db)
 
 
 @router.patch("/revenues/{revenue_id}")
-def revenue_update(revenue_id: int, payload: RevenueInput, actor: ActiveUser, db: DbSession) -> dict[str, object]:
+def revenue_update(
+    revenue_id: int, payload: RevenueInput, actor: ActiveUser, db: DbSession, background_tasks: BackgroundTasks
+) -> dict[str, object]:
     row = db.get(Revenue, revenue_id)
     if not row:
         raise not_found("Revenue")
     row = save_revenue(db, payload.model_dump(), actor, row)
     db.commit()
+    background_tasks.add_task(drain_in_background)
     return revenue_get(row.id, actor, db)
 
 
 @router.post("/revenues/{revenue_id}/correction")
-def revenue_correct(revenue_id: int, payload: RevenueCorrection, actor: Superadmin, db: DbSession) -> dict[str, object]:
+def revenue_correct(
+    revenue_id: int, payload: RevenueCorrection, actor: Superadmin, db: DbSession, background_tasks: BackgroundTasks
+) -> dict[str, object]:
     row = db.get(Revenue, revenue_id)
     if not row:
         raise not_found("Revenue")
@@ -436,6 +455,7 @@ def revenue_correct(revenue_id: int, payload: RevenueCorrection, actor: Superadm
         db, payload.transaction.model_dump(), actor, row, correction=True, reason=payload.correction_reason
     )
     db.commit()
+    background_tasks.add_task(drain_in_background)
     return revenue_get(row.id, actor, db)
 
 
@@ -450,12 +470,15 @@ def revenue_submit(revenue_id: int, actor: ActiveUser, db: DbSession) -> dict[st
 
 
 @router.post("/revenues/{revenue_id}/decision")
-def revenue_decision(revenue_id: int, payload: Decision, actor: Superadmin, db: DbSession) -> dict[str, object]:
+def revenue_decision(
+    revenue_id: int, payload: Decision, actor: Superadmin, db: DbSession, background_tasks: BackgroundTasks
+) -> dict[str, object]:
     row = db.get(Revenue, revenue_id)
     if not row:
         raise not_found("Revenue")
     decide_revenue(db, row, actor, payload.decision, payload.reason, payload.acknowledge_negative_balance)
     db.commit()
+    background_tasks.add_task(drain_in_background)
     return revenue_get(row.id, actor, db)
 
 

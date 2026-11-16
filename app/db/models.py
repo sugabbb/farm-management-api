@@ -7,6 +7,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Computed,
     Date,
     DateTime,
     ForeignKey,
@@ -24,6 +25,12 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin
+
+# A log reference is "<source table>:<source id>:<action>" for automatic entries and "manual:<note>"
+# otherwise; these expressions extract the source of an entry inside the database.
+SOURCE_REFERENCE_PATTERN = "^(operational_cashflows|revenues):[0-9]+:"
+SOURCE_TABLE_SQL = f"CASE WHEN reference ~ '{SOURCE_REFERENCE_PATTERN}' THEN split_part(reference, ':', 1) END"
+SOURCE_ID_SQL = f"CASE WHEN reference ~ '{SOURCE_REFERENCE_PATTERN}' THEN split_part(reference, ':', 2)::bigint END"
 
 
 class User(TimestampMixin, Base):
@@ -234,6 +241,19 @@ class OperationalCashflow(TimestampMixin, Base):
         ),
         CheckConstraint("payment_status IN ('UNPAID','PARTIALLY_PAID','PAID')", name="payment"),
         CheckConstraint("amount_idr >= 0", name="amount"),
+        # Restrict the main cash account audit to top-ups instead of the whole table. The predicate
+        # covers only the type so rows that stop qualifying (e.g. unpaid again) stay visible to it.
+        Index(
+            "ix_operational_cashflows_main_topup",
+            "id",
+            postgresql_where=text("cashflow_type = 'MAIN_ACCOUNT_TOPUP'"),
+        ),
+        Index(
+            "ix_operational_cashflows_main_topup_updated",
+            "updated_at",
+            "id",
+            postgresql_where=text("cashflow_type = 'MAIN_ACCOUNT_TOPUP'"),
+        ),
     )
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     cashflow_type: Mapped[str] = mapped_column(String(40), index=True)
@@ -357,7 +377,7 @@ class OperationalCashflowPayment(TimestampMixin, Base):
 
 class OperationalCashflowBalance(Base):
     __tablename__ = "operational_cashflow_balances"
-    __table_args__ = (CheckConstraint("type IN ('cash_on_hand')", name="type"),)
+    __table_args__ = (CheckConstraint("type IN ('cash_on_hand','waiting_approval','approved_unpaid')", name="type"),)
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
@@ -366,6 +386,106 @@ class OperationalCashflowBalance(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class MainCashAccount(Base):
+    """The single main cash account. Exactly one row may exist (enforced by the singleton index)."""
+
+    __tablename__ = "main_cash_accounts"
+    __table_args__ = (Index("uq_main_cash_accounts_singleton", text("(true)"), unique=True),)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    current_amount: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"), server_default="0")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class MainCashAccountLog(Base):
+    """Immutable ledger of every movement of the main cash account. ``credit`` adds to
+    ``current_amount`` and ``debit`` subtracts from it, so the signed sum of the log always equals
+    the account's ``current_amount``.
+    """
+
+    __tablename__ = "main_cash_account_logs"
+    __table_args__ = (
+        CheckConstraint("direction IN ('credit','debit')", name="direction"),
+        CheckConstraint("amount > 0", name="amount"),
+        # Lets the audit look up "what has already been logged for this source row".
+        Index(
+            "ix_main_cash_account_logs_source",
+            "source_table",
+            "source_id",
+            postgresql_where=text("source_table IS NOT NULL"),
+        ),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    main_cash_account_id: Mapped[int] = mapped_column(
+        ForeignKey("main_cash_accounts.id", ondelete="RESTRICT"), index=True
+    )
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    direction: Mapped[str] = mapped_column(String(10), index=True)
+    reference: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    # Derived from ``reference`` by the database so the audit can join and index the source of an
+    # entry without parsing text per row. NULL for manual adjustments.
+    source_table: Mapped[str | None] = mapped_column(Text, Computed(SOURCE_TABLE_SQL, persisted=True))
+    source_id: Mapped[int | None] = mapped_column(BigInteger, Computed(SOURCE_ID_SQL, persisted=True))
+
+
+class MainCashAccountEvent(Base):
+    """Outbox of main cash account movements that are committed but not posted to the log yet.
+
+    Cashflow/revenue transactions only insert a row here (no lock on the account row); a
+    background worker turns each row into a ``main_cash_account_logs`` entry, moves
+    ``current_amount`` and deletes the row, so the table only ever holds the backlog.
+    """
+
+    __tablename__ = "main_cash_account_events"
+    __table_args__ = (
+        CheckConstraint("source_table IN ('operational_cashflows','revenues')", name="source"),
+        CheckConstraint("delta <> 0", name="delta"),
+        Index("ix_main_cash_account_events_source", "source_table", "source_id"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    source_table: Mapped[str] = mapped_column(String(40))
+    source_id: Mapped[int] = mapped_column(BigInteger)
+    action: Mapped[str] = mapped_column(String(100))
+    # Signed: positive = credit, negative = debit.
+    delta: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class MainCashAccountAuditRun(Base):
+    """One execution of the daily main cash account audit (see app/scripts/audit_main_cash_account.py).
+
+    The most recent successful run is also the watermark an incremental run starts from, and its
+    ``log_high_id``/``new_amount`` let the next run add up only the log entries written since.
+    """
+
+    __tablename__ = "main_cash_account_audit_runs"
+    __table_args__ = (
+        CheckConstraint("mode IN ('full','incremental')", name="mode"),
+        CheckConstraint("status IN ('RUNNING','SUCCESS','FAILED','SKIPPED')", name="status"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    mode: Mapped[str] = mapped_column(String(20), index=True)
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    dry_run: Mapped[bool] = mapped_column(Boolean, default=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    window_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sources_checked: Mapped[int] = mapped_column(BigInteger, default=0)
+    batches: Mapped[int] = mapped_column(Integer, default=0)
+    discrepancies: Mapped[int] = mapped_column(BigInteger, default=0)
+    entries_posted: Mapped[int] = mapped_column(BigInteger, default=0)
+    # Pending outbox events the run posted before auditing (normally 0: the worker keeps up).
+    events_processed: Mapped[int] = mapped_column(BigInteger, default=0)
+    credit_posted: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    debit_posted: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    previous_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 0))
+    new_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 0))
+    log_high_id: Mapped[int | None] = mapped_column(BigInteger)
+    error: Mapped[str | None] = mapped_column(Text)
 
 
 class Revenue(TimestampMixin, Base):
@@ -381,6 +501,18 @@ class Revenue(TimestampMixin, Base):
         ),
         CheckConstraint("payment_status IN ('UNPAID','PARTIALLY_PAID','PAID')", name="payment"),
         CheckConstraint("amount_idr >= 0", name="amount"),
+        # Same idea as the top-up indexes above, for main account transfers.
+        Index(
+            "ix_revenues_main_transfer",
+            "id",
+            postgresql_where=text("revenue_type = 'MAIN_ACCOUNT_TRANSFER'"),
+        ),
+        Index(
+            "ix_revenues_main_transfer_updated",
+            "updated_at",
+            "id",
+            postgresql_where=text("revenue_type = 'MAIN_ACCOUNT_TRANSFER'"),
+        ),
     )
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     revenue_type: Mapped[str] = mapped_column(String(30), index=True)

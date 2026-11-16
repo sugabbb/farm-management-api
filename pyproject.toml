@@ -36,6 +36,12 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
+filterwarnings = [
+  # starlette.testclient (third-party) still references the deprecated anyio.abc.BlockingPortal
+  # alias. Starlette switched to anyio.from_thread.BlockingPortal in 1.7.0, but the pinned FastAPI
+  # only allows starlette<0.51. Remove this filter once FastAPI/Starlette are upgraded.
+  "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning:starlette.testclient",
+]
 
 [tool.ruff]
 target-version = "py314"

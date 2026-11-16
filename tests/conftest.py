@@ -22,7 +22,7 @@ def pytest_sessionstart(session: pytest.Session) -> None:
         raise pytest.UsageError("DATABASE_URL must target a database whose name ends in _test")
 
 
-# --- Shared database fixtures for the operational cashflow / cash on hand tests -------------
+# --- Shared database fixtures for the cashflow / revenue / balance tests ----------------------
 # App modules are imported lazily so the environment defaults above are applied first.
 
 TEST_USER_EMAIL = "cash-balance-tests@example.com"
@@ -34,20 +34,34 @@ def wipe_cashflow_data(db: Session) -> None:
 
     from app.db.models import (
         AuditEvent,
+        MainCashAccount,
+        MainCashAccountAuditRun,
+        MainCashAccountEvent,
+        MainCashAccountLog,
         OperationalCashflow,
         OperationalCashflowBalance,
         OperationalCashflowPayment,
         OperationalCashflowTopupDetail,
         OperationalCashflowUtilityDetail,
+        Revenue,
         User,
     )
 
-    db.execute(delete(AuditEvent).where(AuditEvent.entity_type == "operational_cashflows"))
+    db.execute(
+        delete(AuditEvent).where(
+            AuditEvent.entity_type.in_(("operational_cashflows", "revenues", "main_cash_account_logs"))
+        )
+    )
     db.execute(delete(OperationalCashflowPayment))
     db.execute(delete(OperationalCashflowTopupDetail))
     db.execute(delete(OperationalCashflowUtilityDetail))
     db.execute(delete(OperationalCashflow))
     db.execute(delete(OperationalCashflowBalance))
+    db.execute(delete(Revenue))  # revenue details and payments cascade
+    db.execute(delete(MainCashAccountAuditRun))
+    db.execute(delete(MainCashAccountEvent))
+    db.execute(delete(MainCashAccountLog))
+    db.execute(delete(MainCashAccount))
     db.execute(delete(AuditEvent).where(AuditEvent.entity_type == "users"))
     db.execute(delete(User).where(User.email == TEST_USER_EMAIL))
     db.commit()
