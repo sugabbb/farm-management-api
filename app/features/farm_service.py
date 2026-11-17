@@ -18,6 +18,7 @@ from app.db.models import (
     User,
 )
 from app.features.common import audit, model_snapshot, today_local
+from app.features.lele_biomass_queue import enqueue as enqueue_biomass
 
 ADVISORY_LOCK = 20261009
 
@@ -171,6 +172,7 @@ def save_daily(db: Session, species: str, rows: list[dict[str, Any]], actor: Use
     db.flush()
     for group, from_date in checks.values():
         assert_population_nonnegative(db, group, from_date)
+        enqueue_biomass(db, group, "daily_created")  # mortality changes the population/biomass
     return created
 
 
@@ -190,5 +192,6 @@ def update_daily(db: Session, record_id: int, species: str, data: dict[str, Any]
     replace_daily_children(db, record, species, data)
     db.flush()
     assert_population_nonnegative(db, record.group, record.record_date)
+    enqueue_biomass(db, record.group, "daily_updated")
     audit(db, record, "daily_updated", actor, before=before)
     return record

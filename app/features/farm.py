@@ -1,8 +1,8 @@
 from datetime import date
 from decimal import Decimal
-from typing import Literal
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Query, status
+from fastapi import APIRouter, BackgroundTasks, Query, status
 from pydantic import Field, model_validator
 from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.orm import selectinload
@@ -37,8 +37,16 @@ from app.features.farm_service import (
     save_daily,
     update_daily,
 )
+from app.features.lele_biomass_jobs import drain_in_background as rebuild_biomass_in_background
+from app.features.lele_biomass_queue import enqueue as enqueue_biomass
+from app.features.lele_biomass_queue import enqueue_id as enqueue_biomass_id
+from app.features.lele_biomass_service import grams, refresh_group_results, result_out
 
 router = APIRouter(tags=["Farm Operations"])
+
+
+# Weight of one fish at stocking, in grams (Lele only). Used as the start of the first real ADG.
+InitialWeightG = Annotated[Decimal, Field(gt=0, le=Decimal("100000"))]
 
 
 class GroupCreate(StrictModel):
@@ -47,6 +55,7 @@ class GroupCreate(StrictModel):
     name: str = Field(min_length=1, max_length=255)
     start_date: date
     initial_population: int = Field(ge=0)
+    initial_weight_g: InitialWeightG | None = None
     location: str = Field(min_length=1, max_length=255)
     notes: str | None = Field(default=None, max_length=3000)
 
@@ -55,6 +64,8 @@ class GroupUpdate(StrictModel):
     name: str = Field(min_length=1, max_length=255)
     start_date: date
     initial_population: int = Field(ge=0)
+    # Omitted: keep the stored value (so clients unaware of the field never erase it); null: clear it.
+    initial_weight_g: InitialWeightG | None = None
     location: str = Field(min_length=1, max_length=255)
     notes: str | None = Field(default=None, max_length=3000)
 
@@ -167,6 +178,7 @@ def group_out(db: DbSession, row: LivestockGroup) -> dict[str, object]:
         "name": row.name,
         "start_date": row.start_date.isoformat(),
         "initial_population": row.initial_population,
+        "initial_weight_g": decimal_string(row.initial_weight_g),
         "current_population": population(db, row, row.closed_at),
         "location": row.location,
         "status": row.status,
@@ -224,6 +236,7 @@ def sampling_out(row: LeleSampling) -> dict[str, object]:
             }
             for line in sorted(row.measurements, key=lambda item: item.sequence)
         ],
+        "result": result_out(row.result),
     }
 
 
@@ -257,8 +270,11 @@ def group(group_id: int, _: ActiveUser, db: DbSession) -> dict[str, object]:
 
 
 @router.post("/livestock-groups", status_code=status.HTTP_201_CREATED)
-def create_group(payload: GroupCreate, actor: ActiveUser, db: DbSession) -> dict[str, object]:
+def create_group(
+    payload: GroupCreate, actor: ActiveUser, db: DbSession, background_tasks: BackgroundTasks
+) -> dict[str, object]:
     values = payload.model_dump()
+    values["initial_weight_g"] = initial_weight(payload.species, payload.initial_weight_g)
     submitted = normalize_code(values.pop("code") or "")
     base = normalize_code(
         f"{payload.location}-{payload.name}" if payload.species == "LELE" else f"{payload.name}-{payload.location}"
@@ -273,13 +289,20 @@ def create_group(payload: GroupCreate, actor: ActiveUser, db: DbSession) -> dict
     db.add(row)
     db.flush()
     audit(db, row, "group_created", actor)
+    enqueue_biomass(db, row, "group_created")
     db.commit()
+    # The biomass read model is rebuilt after the response is sent (see lele_biomass_jobs).
+    background_tasks.add_task(rebuild_biomass_in_background)
     return {"data": group_out(db, row)}
 
 
 @router.patch("/livestock-groups/{group_id}")
-def update_group(group_id: int, payload: GroupUpdate, actor: ActiveUser, db: DbSession) -> dict[str, object]:
-    row = db.get(LivestockGroup, group_id)
+def update_group(
+    group_id: int, payload: GroupUpdate, actor: ActiveUser, db: DbSession, background_tasks: BackgroundTasks
+) -> dict[str, object]:
+    # Same lock order as sampling writes: the initial weight feeds the group's sampling results.
+    lock_balances(db)
+    row = db.scalar(select(LivestockGroup).where(LivestockGroup.id == group_id).with_for_update())
     if not row:
         raise not_found("Livestock group")
     if payload.start_date != row.start_date or payload.initial_population != row.initial_population:
@@ -289,13 +312,33 @@ def update_group(group_id: int, payload: GroupUpdate, actor: ActiveUser, db: DbS
         )
     before = model_snapshot(row)
     row.name, row.location, row.notes = payload.name, payload.location, payload.notes
+    weight_changed = False
+    if "initial_weight_g" in payload.model_fields_set:
+        weight = initial_weight(row.species, payload.initial_weight_g)
+        weight_changed = weight != row.initial_weight_g
+        row.initial_weight_g = weight
+    if weight_changed:
+        db.flush()
+        refresh_group_results(db, row.id)
     audit(db, row, "group_updated", actor, before=before)
+    enqueue_biomass(db, row, "group_updated")
     db.commit()
+    background_tasks.add_task(rebuild_biomass_in_background)
     return {"data": group_out(db, row)}
 
 
+def initial_weight(species: str, value: Decimal | None) -> Decimal | None:
+    if value is None:
+        return None
+    if species != "LELE":
+        raise validation("initial_weight_g", "Initial weight is only valid for Lele.")
+    return grams(value)
+
+
 @router.post("/livestock-groups/{group_id}/close")
-def close_group(group_id: int, payload: GroupClose, actor: ActiveUser, db: DbSession) -> dict[str, object]:
+def close_group(
+    group_id: int, payload: GroupClose, actor: ActiveUser, db: DbSession, background_tasks: BackgroundTasks
+) -> dict[str, object]:
     row = db.get(LivestockGroup, group_id)
     if not row:
         raise not_found("Livestock group")
@@ -309,13 +352,19 @@ def close_group(group_id: int, payload: GroupClose, actor: ActiveUser, db: DbSes
     before = model_snapshot(row)
     row.status, row.closed_at, row.closure_reason = "CLOSED", payload.closed_at, payload.reason
     audit(db, row, "group_closed", actor, before=before, reason=payload.reason)
+    enqueue_biomass(db, row, "group_closed")
     db.commit()
+    background_tasks.add_task(rebuild_biomass_in_background)
     return {"data": group_out(db, row)}
 
 
 @router.post("/livestock-groups/{group_id}/population-adjustments", status_code=status.HTTP_201_CREATED)
 def adjust_population(
-    group_id: int, payload: PopulationAdjustmentInput, actor: Superadmin, db: DbSession
+    group_id: int,
+    payload: PopulationAdjustmentInput,
+    actor: Superadmin,
+    db: DbSession,
+    background_tasks: BackgroundTasks,
 ) -> dict[str, object]:
     lock_balances(db)
     group = db.scalar(select(LivestockGroup).where(LivestockGroup.id == group_id).with_for_update())
@@ -328,7 +377,9 @@ def adjust_population(
     db.flush()
     assert_population_nonnegative(db, group, payload.effective_date)
     audit(db, row, "population_adjusted", actor, reason=payload.reason)
+    enqueue_biomass(db, group, "population_adjusted")
     db.commit()
+    background_tasks.add_task(rebuild_biomass_in_background)
     return {"data": model_snapshot(row)}
 
 
@@ -373,17 +424,23 @@ def get_daily(record_id: int, _: ActiveUser, db: DbSession) -> dict[str, object]
 
 
 @router.post("/daily-records/bulk", status_code=status.HTTP_201_CREATED)
-def create_daily(payload: DailyBulk, actor: ActiveUser, db: DbSession) -> dict[str, object]:
+def create_daily(
+    payload: DailyBulk, actor: ActiveUser, db: DbSession, background_tasks: BackgroundTasks
+) -> dict[str, object]:
     rows = save_daily(db, payload.species, [item.model_dump() for item in payload.rows], actor)
     db.commit()
+    background_tasks.add_task(rebuild_biomass_in_background)  # Lele mortality changes the biomass
     loaded = db.scalars(daily_query().where(DailyRecord.id.in_([row.id for row in rows]))).all()
     return {"data": [daily_out(row) for row in loaded]}
 
 
 @router.patch("/daily-records/{record_id}")
-def patch_daily(record_id: int, payload: DailyUpdate, actor: ActiveUser, db: DbSession) -> dict[str, object]:
+def patch_daily(
+    record_id: int, payload: DailyUpdate, actor: ActiveUser, db: DbSession, background_tasks: BackgroundTasks
+) -> dict[str, object]:
     row = update_daily(db, record_id, payload.species, payload.model_dump(exclude={"species"}), actor)
     db.commit()
+    background_tasks.add_task(rebuild_biomass_in_background)
     loaded = db.scalar(daily_query().where(DailyRecord.id == row.id))
     return {"data": daily_out(loaded)}
 
@@ -397,7 +454,9 @@ def samplings(
     from_date: date | None = Query(default=None, alias="from"),
     to_date: date | None = Query(default=None, alias="to"),
 ) -> dict[str, object]:
-    stmt = select(LeleSampling).options(selectinload(LeleSampling.group), selectinload(LeleSampling.measurements))
+    stmt = select(LeleSampling).options(
+        selectinload(LeleSampling.group), selectinload(LeleSampling.measurements), selectinload(LeleSampling.result)
+    )
     if group_id:
         stmt = stmt.where(LeleSampling.group_id == group_id)
     if from_date:
@@ -418,7 +477,11 @@ def sampling(sampling_id: int, _: ActiveUser, db: DbSession) -> dict[str, object
     row = db.scalar(
         select(LeleSampling)
         .where(LeleSampling.id == sampling_id)
-        .options(selectinload(LeleSampling.group), selectinload(LeleSampling.measurements))
+        .options(
+            selectinload(LeleSampling.group),
+            selectinload(LeleSampling.measurements),
+            selectinload(LeleSampling.result),
+        )
     )
     if not row:
         raise not_found("Lele sampling")
@@ -453,6 +516,7 @@ def save_sampling(
     if duplicate:
         raise conflict("SAMPLING_EXISTS", "A sampling already exists for this group and date.")
     before = model_snapshot(row) if row else None
+    previous_group_id = row.group_id if row else None
     row = row or LeleSampling(created_by=actor.id)
     row.group_id, row.sampling_date, row.notes = group.id, payload.sampling_date, payload.notes
     db.add(row)
@@ -467,21 +531,35 @@ def save_sampling(
                 total_weight_kg=quantity(line.total_weight_kg),
             )
         )
+    db.flush()
+    # Per-fish weight and ADG depend on the neighbouring samplings, so rebuild the whole group
+    # (and the group the sampling moved away from, if any).
+    refresh_group_results(db, group.id)
+    enqueue_biomass_id(db, group.id, "sampling_saved")
+    if previous_group_id is not None and previous_group_id != group.id:
+        refresh_group_results(db, previous_group_id)
+        enqueue_biomass_id(db, previous_group_id, "sampling_moved")
     audit(db, row, "lele_sampling_updated" if before else "lele_sampling_created", actor, before=before)
     return row
 
 
 @router.post("/lele-samplings", status_code=status.HTTP_201_CREATED)
-def create_sampling(payload: SamplingInput, actor: ActiveUser, db: DbSession) -> dict[str, object]:
+def create_sampling(
+    payload: SamplingInput, actor: ActiveUser, db: DbSession, background_tasks: BackgroundTasks
+) -> dict[str, object]:
     row = save_sampling(db, payload, actor)
     db.commit()
+    background_tasks.add_task(rebuild_biomass_in_background)
     return sampling(row.id, actor, db)
 
 
 @router.patch("/lele-samplings/{sampling_id}")
-def update_sampling(sampling_id: int, payload: SamplingInput, actor: ActiveUser, db: DbSession) -> dict[str, object]:
+def update_sampling(
+    sampling_id: int, payload: SamplingInput, actor: ActiveUser, db: DbSession, background_tasks: BackgroundTasks
+) -> dict[str, object]:
     row = save_sampling(db, payload, actor, sampling_id)
     db.commit()
+    background_tasks.add_task(rebuild_biomass_in_background)
     return sampling(row.id, actor, db)
 
 

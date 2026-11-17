@@ -40,6 +40,12 @@ def test_schema_contains_only_retained_tables() -> None:
         "revenue_payments",
         "lele_samplings",
         "lele_sampling_measurements",
+        "lele_sampling_results",
+        "lele_biomass_jobs",
+        "lele_biomass_snapshots",
+        "lele_biomass_chart_dates",
+        "lele_biomass_chart_series",
+        "lele_biomass_chart_values",
         "audit_events",
     }
     assert set(Base.metadata.tables) == expected

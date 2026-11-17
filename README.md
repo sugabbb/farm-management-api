@@ -1,6 +1,6 @@
 # Farm Management API
 
-Synchronous FastAPI/PostgreSQL replacement for the transactional parts of the former Laravel dashboard. The service contains no frontend, reports, Excel generation/import, ABK integration, derived analytics, background worker, or scheduler.
+Synchronous FastAPI/PostgreSQL replacement for the transactional parts of the former Laravel dashboard. The service contains no frontend, reports, Excel generation/import, ABK integration, background worker, or scheduler. The only derived analytics are the Lele biomass/ADG projections described below.
 
 ## Runtime
 
@@ -188,6 +188,81 @@ Measured on 1,000,000 operational cashflows + 300,000 revenues (80,000 of them m
 The audit does not take the cashflow/revenue write lock, so API writes are not delayed by it.
 
 If the full sweep ever becomes too slow, lower `--batch-size` (shorter locks, more batches), run `--mode full` less often, and rely on `--mode incremental` daily.
+
+## Lele biomass and average daily gain (ADG)
+
+### Stocking weight
+
+`POST /api/v1/livestock-groups` and `PATCH /api/v1/livestock-groups/{id}` accept an optional `initial_weight_g`: the weight of one fish (grams, > 0) on the group's `start_date`. It is valid only for Lele (422 for Ayam) and is stored in `livestock_groups.initial_weight_g`. On `PATCH`, omitting the field keeps the stored value and `null` clears it. A change recomputes the group's sampling results (only the first sampling's ADG changes).
+
+### Per-sampling results
+
+Every Lele sampling (`POST`/`PATCH /api/v1/lele-samplings`, 3 batches of 10 fish) also stores a row in `lele_sampling_results`:
+
+| Column | Meaning |
+| --- | --- |
+| `fish_count`, `total_weight_kg` | sum of the three batches (30 fish) |
+| `average_weight_g` | weight of one fish: `total_weight_kg * 1000 / fish_count`, e.g. 0.300 + 0.350 + 0.400 kg = 35.000 g |
+| `previous_sampling_id`, `days_since_previous` | start of the ADG interval: the group's preceding sampling, or for the first sampling the stocking (`previous_sampling_id` NULL, the group's `start_date` and `initial_weight_g`) |
+| `weight_gain_g`, `adg_g` | gain per fish over that interval, and the **real ADG** = gain / days |
+
+Each real ADG is its own row and is kept: with a stocking weight, N samplings give N real ADGs (stocking→#1, #1→#2, ...); without one, N − 1 (the first sampling has none, as does a first sampling on the start date). Adding a newer sampling only inserts a row. The rows of the whole group are rebuilt on every sampling create/update and stocking weight change, so a backdated or corrected sampling also fixes the ADG of the sampling after it; rows whose values do not change are not rewritten. A negative ADG (sampling noise) is stored as measured. The same values appear as `result` in every `lele-samplings` response, with `adg_from` = `STOCKING`/`SAMPLING`/`null`, and as the `Real ADG #n` lines of the biomass chart.
+
+### Biomass endpoint
+
+`GET /api/v1/lele-biomass/{group_id}` (any active user) returns everything the biomass page of one group needs, with no ids or other keys. It only reads a precomputed read model (below); the only thing it calculates is today's estimate, because that changes every day without any write.
+
+| Field | Content |
+| --- | --- |
+| `group` | name, location, status, start/closing date, age in days, initial and current population, initial (stocking) weight, notes |
+| `latest_sampling`, `samplings` | per sampling date: day since start, weight of one fish, population and biomass (kg) = population * weight |
+| `projection` | the **harvest prediction**: from the baseline (latest sampling, or the stocking when there is no sampling yet; `baseline.source` = `SAMPLING`/`STOCKING`), days to target = ceil((`LELE_TARGET_WEIGHT_G` (142 g) - baseline weight) / ADG) and `projected_sell_date`. The ADG is the **latest real ADG** (`adg_source` = `ACTUAL`); the default `LELE_DEFAULT_ADG_G` (1.3 g/day, `DEFAULT`) is only a fallback while there is no positive real ADG. Also `ready_to_sell`, `remaining_weight_g`, and `projected_biomass_kg` (current population at the target weight) |
+| `estimate` | weight and biomass today (for a closed group, its closing date), growing the baseline weight by the projection's ADG, **never past the harvest date**: once it has passed, the estimate is the weight on the harvest date and `capped_at_harvest_date` is true |
+| `chart` | the weight line chart, below |
+| `sync` | `computed_at` of the read model and `pending` = a newer rebuild is still queued |
+
+`chart` is ready for a line chart with weight on Y (`y_min_g` 0 to `y_max_g`, the highest value on the chart; `target_weight_g` for a 142 g reference line) and dates on X:
+
+- `dates` (X axis): every 7 days from the start date (`week` = 0, 1, 2, ...) up to `end_date`, plus each sampling date between two weeks and the end date itself (`week` = null). `end_date` is the harvest date of the projection (`is_harvest_date`), capped at 365 days after the start. `day` is the number of days since the start and `is_sampling` marks sampling dates.
+- `series`: one line per entry, each with `values` aligned with `dates` (decimal strings, `null` where the line has no point):
+  - `Actual weight` (`type` = `ACTUAL`): the measured weights (stocking weight and samplings) only, `null` on the other dates, so let the chart connect the gaps (Chart.js `spanGaps`, Recharts/ECharts `connectNulls`).
+  - `Default ADG` (`DEFAULT`): the default ADG from the baseline (all `null` without any known weight).
+  - `Real ADG #1`, `#2`, ... (`REAL`): every real ADG, oldest first. The highest number is the latest and has `is_latest` = true: it is the harvest prediction and reaches the target on the last date. Each line starts at the sampling where its ADG was measured (`start_date`, `start_weight_g`) and continues at that ADG, so on the last date the other lines can be above or below 142 g. `period` describes the interval the ADG was measured over (`from` = `STOCKING`/`SAMPLING`, dates, days, weights, gain).
+  - `adg_g`, `days_to_target` and `projected_sell_date` (when that line alone would reach the target, possibly after the chart's end; `null` if its ADG is not positive) for every ADG line.
+
+A group with neither samplings nor a stocking weight returns `null` projection/estimate and a chart with only its start date. The response is 202 (`BIOMASS_PENDING`) when a new group's read model is still being computed, and 404 for a group that has none (not Lele, or not backfilled yet). Both settings are optional environment variables; after changing them, re-run the backfill.
+
+### Read model and background rebuild
+
+| Table | Rows |
+| --- | --- |
+| `lele_biomass_snapshots` | one per Lele group: group details, latest sampling, harvest prediction, chart bounds, `computed_at` |
+| `lele_biomass_chart_dates` | the X axis of the group's chart, with the measured weight, population and biomass on measured dates |
+| `lele_biomass_chart_series` | one per ADG line (default, real #n) with its ADG, start, sell date and measured interval |
+| `lele_biomass_chart_values` | the weight of each line on each chart date it covers |
+| `lele_biomass_jobs` | queue of groups to rebuild |
+
+Every change that affects a group's biomass page inserts a job in the same transaction as the change (so it can be neither lost nor processed before the change is committed): group create/edit (including the initial weight)/close, sampling create/edit (both groups when a sampling moves), daily records (mortality) and population adjustments of Lele groups. The group's rows are then rebuilt from scratch in the background, so an edited sampling recalculates every dependent value (ADGs, lines, harvest date, biomass):
+
+1. a FastAPI background task started after each of those responses (normally within milliseconds);
+2. optionally a dedicated worker, for hosts where work after the response is not reliable:
+   ```bash
+   python -m app.scripts.lele_biomass_worker          # long running, polls every 5 s
+   python -m app.scripts.lele_biomass_worker --once   # drain and exit (e.g. cron every minute)
+   ```
+
+Each group is rebuilt in its own transaction; readers see the old rows until it commits. Rebuilds of the same group are serialised and a change committed during a rebuild keeps its own job, so the read model always ends on the latest data. A group whose rebuild fails is logged and stays queued for the next trigger without blocking the others.
+
+### Backfill
+
+Samplings recorded before `lele_sampling_results` existed, and the read model of existing groups, are computed by a manual, idempotent backfill after `alembic upgrade head`:
+
+```bash
+python -m app.scripts.backfill_lele_sampling_results --dry-run   # print what would change
+python -m app.scripts.backfill_lele_sampling_results             # write it
+```
+
+It recomputes every sampling result and rebuilds the read model of every Lele group with the same code as the API, under the same locks, so it is safe while the API is running. Re-run it to repair the data after any manual database edit, or after changing the settings. Existing groups have no stocking weight; entering one through `PATCH /api/v1/livestock-groups/{id}` recomputes that group.
 
 ## Tests and checks
 

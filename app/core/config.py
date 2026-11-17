@@ -1,3 +1,4 @@
+from decimal import Decimal
 from functools import lru_cache
 from typing import Annotated
 from zoneinfo import ZoneInfo
@@ -25,6 +26,10 @@ class Settings(BaseSettings):
     google_cloud_storage_prefix: str = ""
     google_application_credentials: str = ""
     log_level: str = "INFO"
+    # Lele biomass analytics: assumed average daily gain (grams per fish per day) used when a group
+    # has no real ADG from samplings yet, and the per-fish weight at which a group is ready to sell.
+    lele_default_adg_g: Decimal = Field(default=Decimal("1.3"), gt=0)
+    lele_target_weight_g: Decimal = Field(default=Decimal("142"), gt=0)
 
     @field_validator("cors_allowed_origins", mode="before")
     @classmethod

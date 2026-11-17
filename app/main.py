@@ -13,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from app.core.config import settings
 from app.core.errors import AppError
 from app.db.session import SessionLocal
-from app.features import auth, farm, finance, main_cash_account, people
+from app.features import auth, farm, finance, lele_biomass, main_cash_account, people
 from app.features import settings as settings_feature
 
 logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -93,6 +93,7 @@ for feature_router in (
     auth.router,
     people.router,
     farm.router,
+    lele_biomass.router,
     settings_feature.router,
     finance.router,
     main_cash_account.router,
