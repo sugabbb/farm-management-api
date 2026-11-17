@@ -34,6 +34,12 @@ def wipe_cashflow_data(db: Session) -> None:
 
     from app.db.models import (
         AuditEvent,
+        CashStatement,
+        Customer,
+        FinancialOpeningBalance,
+        Lender,
+        Loan,
+        LoanRepayment,
         MainCashAccount,
         MainCashAccountAuditRun,
         MainCashAccountEvent,
@@ -49,15 +55,31 @@ def wipe_cashflow_data(db: Session) -> None:
 
     db.execute(
         delete(AuditEvent).where(
-            AuditEvent.entity_type.in_(("operational_cashflows", "revenues", "main_cash_account_logs"))
+            AuditEvent.entity_type.in_(
+                (
+                    "operational_cashflows",
+                    "revenues",
+                    "main_cash_account_logs",
+                    "financial_opening_balances",
+                    "customers",
+                    "loans",
+                    "lenders",
+                )
+            )
         )
     )
+    db.execute(delete(CashStatement))
+    db.execute(delete(LoanRepayment))
+    db.execute(delete(Loan))  # installments cascade
+    db.execute(delete(Lender))
+    db.execute(delete(FinancialOpeningBalance))
     db.execute(delete(OperationalCashflowPayment))
     db.execute(delete(OperationalCashflowTopupDetail))
     db.execute(delete(OperationalCashflowUtilityDetail))
     db.execute(delete(OperationalCashflow))
     db.execute(delete(OperationalCashflowBalance))
     db.execute(delete(Revenue))  # revenue details and payments cascade
+    db.execute(delete(Customer))
     db.execute(delete(MainCashAccountAuditRun))
     db.execute(delete(MainCashAccountEvent))
     db.execute(delete(MainCashAccountLog))

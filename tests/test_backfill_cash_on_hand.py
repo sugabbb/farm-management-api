@@ -1,12 +1,12 @@
 """Tests for the manual CLI backfill: python -m app.scripts.backfill_cash_on_hand."""
 
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
 from sqlalchemy.orm import Session
 
-from app.db.models import OperationalCashflow, OperationalCashflowBalance, User
+from app.db.models import OperationalCashflow, OperationalCashflowBalance, OperationalCashflowPayment, User
 from app.features.cash_balance_service import CASH_ON_HAND, calculate_cash_on_hand, get_balance
 from app.features.finance_service import (
     decide_operational,
@@ -18,21 +18,38 @@ from app.features.finance_service import (
 from app.scripts.backfill_cash_on_hand import backfill_cash_on_hand, main
 
 
-def legacy_cashflow(db: Session, actor: User, cashflow_type: str, payment_status: str, amount: str) -> None:
+def legacy_cashflow(
+    db: Session, actor: User, cashflow_type: str, payment_status: str, amount: str, paid: tuple[str, ...] = ()
+) -> None:
     """Insert a row straight into operational_cashflows, bypassing the service layer, to mimic
-    history that existed before the balance table (the live sync never saw these rows)."""
+    history that existed before the balance table (the live sync never saw these rows). ``paid``
+    are its payments; one prefixed with ``-`` is stored as voided."""
     topup = cashflow_type == "MAIN_ACCOUNT_TOPUP"
-    db.add(
-        OperationalCashflow(
-            cashflow_type=cashflow_type,
-            direction="INFLOW" if topup else "OUTFLOW",
-            transaction_date=date(2026, 1, 15),
-            amount_idr=Decimal(amount),
-            approval_status="NOT_REQUIRED" if topup else "APPROVED",
-            payment_status=payment_status,
-            created_by=actor.id,
-        )
+    row = OperationalCashflow(
+        cashflow_type=cashflow_type,
+        direction="INFLOW" if topup else "OUTFLOW",
+        transaction_date=date(2026, 1, 15),
+        amount_idr=Decimal(amount),
+        approval_status="NOT_REQUIRED" if topup else "APPROVED",
+        payment_status=payment_status,
+        created_by=actor.id,
     )
+    db.add(row)
+    db.flush()
+    for value in paid:
+        voided = value.startswith("-")
+        db.add(
+            OperationalCashflowPayment(
+                operational_cashflow_id=row.id,
+                paid_date=date(2026, 1, 16),
+                amount_idr=Decimal(value.lstrip("-")),
+                payment_mode="PARTIAL",
+                created_by=actor.id,
+                voided_at=datetime(2026, 1, 17, tzinfo=UTC) if voided else None,
+                voided_by=actor.id if voided else None,
+                void_reason="voided" if voided else None,
+            )
+        )
 
 
 @pytest.fixture
@@ -41,11 +58,12 @@ def legacy_history(db: Session, actor: User) -> Decimal:
     legacy_cashflow(db, actor, "MAIN_ACCOUNT_TOPUP", "PAID", "5000000")  # +5,000,000
     legacy_cashflow(db, actor, "MAIN_ACCOUNT_TOPUP", "PAID", "1000000")  # +1,000,000
     legacy_cashflow(db, actor, "FEED_AYAM", "PAID", "1200000")  # -1,200,000
-    legacy_cashflow(db, actor, "SALARY", "PARTIALLY_PAID", "800000")  # -800,000 (full amount_idr)
+    # -300,000: only what was actually paid (the voided payment does not count)
+    legacy_cashflow(db, actor, "SALARY", "PARTIALLY_PAID", "800000", ("300000", "-100000"))
     legacy_cashflow(db, actor, "UTILITY", "UNPAID", "300000")  # ignored: not paid yet
     legacy_cashflow(db, actor, "OTHER", "UNPAID", "999999")  # ignored: not paid yet
     db.commit()
-    return Decimal("4000000")
+    return Decimal("4500000")
 
 
 def row_count(db: Session) -> int:
@@ -145,7 +163,7 @@ def test_backfill_agrees_with_the_live_incremental_balance(db: Session, actor: U
 
     live = get_balance(db, CASH_ON_HAND)
     assert live is not None
-    assert live.amount == Decimal("1350000")  # 2,000,000 - 250,000 - 400,000
+    assert live.amount == Decimal("1650000")  # 2,000,000 - 250,000 - 100,000 (partial payment only)
     recalculated, _ = calculate_cash_on_hand(db)
     assert recalculated == live.amount
 
@@ -156,7 +174,7 @@ def test_backfill_agrees_with_the_live_incremental_balance(db: Session, actor: U
 def test_cli_main(db: Session, legacy_history: Decimal, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["--dry-run"]) == 0
     out = capsys.readouterr().out
-    assert "Recalculated cash_on_hand amount:    4000000" in out
+    assert "Recalculated cash_on_hand amount:    4500000" in out
     assert "Dry run: nothing was written." in out
     assert row_count(db) == 0
 

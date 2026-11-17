@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from app.db.models import OperationalCashflowBalance, User
-from app.features.cash_balance_service import CASH_ON_HAND, cash_on_hand, get_balance
+from app.features.cash_balance_service import CASH_ON_HAND, calculate_cash_on_hand, cash_on_hand, get_balance
 from app.features.finance_service import (
     decide_operational,
     pay_operational,
@@ -96,7 +96,7 @@ def test_unpaid_outflow_does_not_affect_balance_until_paid(db: Session, actor: U
     assert balance.amount == Decimal("880000")
 
 
-def test_partial_payment_deducts_full_amount_once_and_full_payment_does_not_double_count(
+def test_partial_payment_deducts_only_the_paid_amount_and_full_payment_deducts_the_rest(
     db: Session, actor: User
 ) -> None:
     save_operational(db, topup(Decimal("1000000")), actor)
@@ -113,13 +113,13 @@ def test_partial_payment_deducts_full_amount_once_and_full_payment_does_not_doub
     db.commit()
     assert row.payment_status == "PARTIALLY_PAID"
     balance = get_balance(db, CASH_ON_HAND)
-    assert balance.amount == Decimal("800000"), "full amount_idr is deducted once partially paid"
+    assert balance.amount == Decimal("950000"), "only the partially paid amount leaves the cash on hand"
 
     pay_operational(db, row, actor, date.today(), "FULL", None)
     db.commit()
     assert row.payment_status == "PAID"
     balance = get_balance(db, CASH_ON_HAND)
-    assert balance.amount == Decimal("800000"), "moving from partially-paid to paid must not double count"
+    assert balance.amount == Decimal("800000"), "the settling payment deducts only the remaining 150,000"
 
 
 def test_voiding_the_only_payment_restores_the_balance(db: Session, actor: User) -> None:
@@ -143,6 +143,42 @@ def test_voiding_the_only_payment_restores_the_balance(db: Session, actor: User)
     assert row.payment_status == "UNPAID"
     balance = get_balance(db, CASH_ON_HAND)
     assert balance.amount == Decimal("1000000")
+
+
+def test_each_partial_payment_voids_and_corrections_move_only_the_paid_amount(db: Session, actor: User) -> None:
+    save_operational(db, topup(Decimal("1000000")), actor)
+    db.commit()
+    row = save_operational(db, utility(Decimal("300000")), actor)
+    submit_operational(db, row, actor)
+    decide_operational(db, row, actor, "APPROVED", None)
+    db.commit()
+
+    def amount() -> Decimal:
+        db.expire_all()
+        return get_balance(db, CASH_ON_HAND).amount
+
+    row = pay_operational(db, row, actor, date.today(), "PARTIAL", Decimal("100000"))
+    db.commit()
+    assert amount() == Decimal("900000")
+    row = pay_operational(db, row, actor, date.today(), "PARTIAL", Decimal("50000"))
+    db.commit()
+    assert amount() == Decimal("850000"), "each partial payment subtracts its own amount"
+
+    row = void_operational_payment(db, row, row.payments[0], actor, "Recorded twice")
+    db.commit()
+    assert row.payment_status == "PARTIALLY_PAID"
+    assert amount() == Decimal("950000"), "the voided 100,000 comes back"
+
+    # A correction of the amount does not move money: only the 50,000 paid has left.
+    row = save_operational(db, utility(Decimal("250000")), actor, row, correction=True, reason="Discount")
+    db.commit()
+    assert amount() == Decimal("950000")
+
+    pay_operational(db, row, actor, date.today(), "FULL", None)
+    db.commit()
+    assert amount() == Decimal("750000"), "the settling payment subtracts the remaining 200,000"
+    recalculated, _ = calculate_cash_on_hand(db)
+    assert recalculated == Decimal("750000"), "the backfill recalculation agrees with the live balance"
 
 
 def test_cash_on_hand_endpoint_returns_the_stored_amount(db: Session, actor: User, actor_password: str) -> None:

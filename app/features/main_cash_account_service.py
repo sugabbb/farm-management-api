@@ -1,6 +1,6 @@
 """Maintains the main cash account (``main_cash_accounts``) and its ledger (``main_cash_account_logs``).
 
-Money enters and leaves the main account through two existing transaction types:
+Money enters and leaves the main account through these transactions:
 
 - ``operational_cashflows`` with ``cashflow_type = 'MAIN_ACCOUNT_TOPUP'``: the main account tops up
   the operational cash, so once the top-up is ``PAID`` its ``amount_idr`` is a **debit**
@@ -8,6 +8,8 @@ Money enters and leaves the main account through two existing transaction types:
 - ``revenues`` with ``revenue_type = 'MAIN_ACCOUNT_TRANSFER'``: revenue is transferred into the main
   account, so once the transfer is ``PAID`` (approved) its ``amount_idr`` (the net amount: gross minus
   the transfer cost) is a **credit** (``current_amount`` increases).
+- ``loan_repayments``: a loan repayment is paid out of the main account, so its ``amount`` is a
+  **debit** as long as the repayment is not voided (a void posts the offsetting credit).
 
 Like the operational cashflow balances, the sync is state based: every write compares the source
 row's effect before and after the change and records the difference. A Superadmin correction of an
@@ -50,13 +52,16 @@ DIRECTIONS = (CREDIT, DEBIT)
 
 CASHFLOW_SOURCE = "operational_cashflows"
 REVENUE_SOURCE = "revenues"
+LOAN_REPAYMENT_SOURCE = "loan_repayments"
 MANUAL_SOURCE = "manual"
-SOURCES = (CASHFLOW_SOURCE, REVENUE_SOURCE, MANUAL_SOURCE)
+# Sources whose entries reference one row (``<table>:<id>:<action>``).
+ROW_SOURCES = (CASHFLOW_SOURCE, REVENUE_SOURCE, LOAN_REPAYMENT_SOURCE)
+SOURCES = (*ROW_SOURCES, MANUAL_SOURCE)
 
 TOPUP_TYPE = "MAIN_ACCOUNT_TOPUP"
 TRANSFER_TYPE = "MAIN_ACCOUNT_TRANSFER"
 
-SOURCE_REFERENCE = re.compile(rf"^({CASHFLOW_SOURCE}|{REVENUE_SOURCE}):(\d+):(.*)$", re.DOTALL)
+SOURCE_REFERENCE = re.compile(rf"^({'|'.join(ROW_SOURCES)}):(\d+):(.*)$", re.DOTALL)
 
 
 # --- Account row --------------------------------------------------------------------------------
@@ -114,6 +119,11 @@ class RevenueState:
     @classmethod
     def of(cls, row: Revenue) -> RevenueState:
         return cls(row.revenue_type, row.payment_status, Decimal(row.amount_idr))
+
+
+def repayment_effect(voided: bool, amount: Decimal) -> Decimal:
+    """Signed effect of a loan repayment on the main account (repayments are debits until voided)."""
+    return Decimal("0") if voided else -amount
 
 
 def cashflow_state_effect(state: CashflowState | None) -> Decimal:
@@ -196,10 +206,14 @@ def adjust(db: Session, direction: str, amount: Decimal, note: str, actor: User)
     """Manual credit/debit entered through the API (for example the opening balance or a bank
     fee that does not come from operational cashflows or revenues). Posted immediately; it only
     needs the account row lock, not the cashflow/revenue write lock."""
+    # Imported here: cash_statement_service reuses this module's constants.
+    from app.features.cash_statement_service import LOG_SOURCE, sync_cash_statements
+
     delta = amount if direction == CREDIT else -amount
     entry = post_entry(db, delta, manual_reference(note))
     assert entry is not None
     audit(db, entry, "main_cash_account_adjusted", actor, reason=note)
+    sync_cash_statements(db, LOG_SOURCE, entry.id)
     return entry
 
 

@@ -89,7 +89,7 @@ Transaction and payment data use typed JSON endpoints. Optional JPG/PNG proofs a
 
 `operational_cashflow_balances` keeps one running row per type, updated automatically on every operational cashflow transaction (create, update/correction, submit, approve/reject, payment, payment void):
 
-- `cash_on_hand`: paid `MAIN_ACCOUNT_TOPUP` adds `amount_idr`; any other type that is `PAID` or `PARTIALLY_PAID` subtracts `amount_idr`.
+- `cash_on_hand`: the real cash on hand. A paid `MAIN_ACCOUNT_TOPUP` adds `amount_idr`; any other type subtracts only what was actually paid on it: its `amount_idr` once `PAID`, the sum of its non-voided payments while `PARTIALLY_PAID`. Each partial payment subtracts its own amount, a void gives it back, and correcting the amount of a partially paid cashflow does not move the balance.
 - `waiting_approval`: a cashflow adds `amount_idr` when its `approval_status` becomes `SUBMITTED`, and the amount is removed again when it is approved or rejected. The balance is therefore the total amount currently waiting for a decision. A Superadmin correction of a submitted cashflow adjusts it by the difference.
 - `approved_unpaid`: for every `APPROVED` cashflow, what is still unpaid on it: the latest `amount_idr` minus its non-voided payments. Unpaid rows count in full, partially paid rows count only their remainder, and paid rows count nothing. Approvals add, payments reduce, voids restore, and edits/corrections re-derive the remainder from the latest amount. If a higher amount sends an approved row back to `DRAFT`, it is removed until it is approved again.
 
@@ -109,13 +109,14 @@ This is a manual data command, not an Alembic migration. It recalculates each ba
 
 - **debit**: an operational cashflow `MAIN_ACCOUNT_TOPUP` once `PAID` (it is paid on creation). Money leaves the main account to top up cash on hand.
 - **credit**: a revenue `MAIN_ACCOUNT_TRANSFER` once `PAID` (on approval), for its `amount_idr` = gross minus transfer cost. Money arrives in the main account.
+- **debit**: a loan repayment (`loan_repayments`), for its `amount`; voiding it posts the offsetting **credit**. See [Loans](#loans).
 
-Each write posts only the difference between the row's effect before and after. A Superadmin correction of a posted top-up/transfer therefore adds one offsetting entry (a top-up corrected from 1000 to 800 posts a `credit` of 200), and the signed sum of the log always equals `current_amount`. `reference` is `<table>:<id>:<action>` for automatic entries (e.g. `operational_cashflows:12:cashflow_created`, `revenues:7:transfer_approved`) and `manual:<note>` for manual adjustments.
+Each write posts only the difference between the row's effect before and after. A Superadmin correction of a posted top-up/transfer therefore adds one offsetting entry (a top-up corrected from 1000 to 800 posts a `credit` of 200), and the signed sum of the log always equals `current_amount`. `reference` is `<table>:<id>:<action>` for automatic entries (e.g. `operational_cashflows:12:cashflow_created`, `revenues:7:transfer_approved`, `loan_repayments:3:loan_repaid`) and `manual:<note>` for manual adjustments.
 
 | Method | Path | Access | Purpose |
 | --- | --- | --- | --- |
 | GET | `/api/v1/main-cash-account` | any active user | `id`, `current_amount`, `updated_at` |
-| GET | `/api/v1/main-cash-account/logs` | any active user | paginated, newest first; filters `direction`, `source` (`operational_cashflows`/`revenues`/`manual`), `source_id`, `from`/`to` (business dates in `APP_TIMEZONE`) |
+| GET | `/api/v1/main-cash-account/logs` | any active user | paginated, newest first; filters `direction`, `source` (`operational_cashflows`/`revenues`/`loan_repayments`/`manual`), `source_id`, `from`/`to` (business dates in `APP_TIMEZONE`) |
 | GET | `/api/v1/main-cash-account/logs/{log_id}` | any active user | one entry |
 | POST | `/api/v1/main-cash-account/adjustments` | Superadmin | manual `credit`/`debit` with a `note`, e.g. the opening balance or a bank fee (audited) |
 
@@ -157,7 +158,7 @@ It is the same engine as the daily audit (below) run in full mode. For every top
 
 What it checks:
 
-- **source -> log**: every paid `MAIN_ACCOUNT_TOPUP` and paid `MAIN_ACCOUNT_TRANSFER` must appear in the log with its signed effect;
+- **source -> log**: every paid `MAIN_ACCOUNT_TOPUP`, paid `MAIN_ACCOUNT_TRANSFER` and non-voided loan repayment must appear in the log with its signed effect;
 - **log -> source**: every logged source entry must still be justified, so entries whose source was edited, unpaid again or deleted are corrected too;
 - movements still queued for background posting count as logged (never double posted); a non dry run drains the queue first;
 - manual adjustments (`manual:...`) are never touched.
@@ -188,6 +189,104 @@ Measured on 1,000,000 operational cashflows + 300,000 revenues (80,000 of them m
 The audit does not take the cashflow/revenue write lock, so API writes are not delayed by it.
 
 If the full sweep ever becomes too slow, lower `--batch-size` (shorter locks, more batches), run `--mode full` less often, and rely on `--mode incremental` daily.
+
+## Cash statements (finance statement)
+
+`cash_statements` is the bank-statement view of the business: one row per **real cash movement**, on the date the money actually moved, with `credit` = money in and `debit` = money out. It is the data source of the finance module (monthly cashflow, revenue performance, loans, journal reporting). Nothing is recorded for drafts, submissions, approvals or the unpaid part of a transaction.
+
+| Source | Rows | Direction | Date |
+| --- | --- | --- | --- |
+| `operational_cashflows`, every type except `MAIN_ACCOUNT_TOPUP` | once `PARTIALLY_PAID`/`PAID`: one row per non-voided payment, for that payment's amount | debit | payment `paid_date` |
+| `revenues`, every type except `MAIN_ACCOUNT_TRANSFER` | once `PARTIALLY_PAID`/`PAID`: one row per non-voided payment; an approved `DIRECT_TRANSFER` sale (no payment rows) is one row for its amount | credit | payment `paid_date` / transfer date |
+| `revenues`, `MAIN_ACCOUNT_TRANSFER` | once approved (`PAID`) and only if it has a fee: one row for `payment_cost_idr` only | debit | paid date |
+| `main_cash_account_logs` | manual adjustments (`manual:<note>`) only; entries posted automatically for top-ups/transfers/loan repayments are excluded | their own | posting date |
+| `loans` (non-voided `loan_repayments`) | one row per repayment for its full amount (`LOAN_REPAYMENT`), reference `loans:<loan id>`; the principal/interest split stays in the loan tables | debit | repayment `paid_date` |
+
+Top-ups and main account transfers are excluded because they only move money between the business's own accounts; the transfer fee is the part that actually leaves. A `PAID` transaction without any payment row (recorded outside the API) is one row for its full amount on its paid date.
+
+**Partial payments.** A transaction paid in parts has one row per payment, each for the amount of that payment only. The rows share the same `reference` (`<source table>:<source id>`, e.g. `operational_cashflows:12`) and their descriptions are numbered: `Utility: Electricity (partial payment 1)`, `(partial payment 2)`, `(final payment 3)`; a transaction settled by a single payment has no suffix. A voided payment disappears and the remaining ones are renumbered.
+
+**Source details.** Every row also stores `category` (the cashflow/revenue type, `TRANSFER_FEE` or `MANUAL_ADJUSTMENT`), a `description` built from the transaction details, the `counterparty` (customer of a sale, employee of a salary), and where it comes from: `source_table`, `source_id`, `source_line` (`payment:<payment id>`, `paid`, `fee`, `manual`), `payment_id` and `payment_sequence` for payment rows, and the transaction's current `source_transaction_date`, `source_amount` (a transfer fee: the transfer's gross amount) and `source_payment_status`. `(source_table, source_id, source_line)` is unique, which is what makes the population idempotent.
+
+The cashflow debits explain the cash on hand: `cash_on_hand` = paid top-ups - the `operational_cashflows` debits of the statement.
+
+| Method | Path | Access | Purpose |
+| --- | --- | --- | --- |
+| GET | `/api/v1/cash-statements` | any active user | paginated statement, newest first; each row has `debit`/`credit`, the running `balance` after it (over the whole statement, whatever the filters), `reference` and `source` details; filters `direction`, `category`, `reference`, `source_table` + `source_id`, `from`/`to` (statement dates) |
+
+### Population and sync
+
+Every write that moves money (cashflow/revenue create, update, correction, decision, payment, void; manual main account adjustment) replaces the rows of that one transaction inside the same database transaction, so the statement is never behind the API. Transactions that existed before the table was introduced are populated by a manual, idempotent backfill after `alembic upgrade head`:
+
+```bash
+python -m app.scripts.backfill_cash_statements --dry-run   # print what would change and the resulting totals
+python -m app.scripts.backfill_cash_statements             # write it
+python -m app.scripts.backfill_cash_on_hand --type cash_on_hand   # once: recompute cash on hand with the partial payment rule
+```
+
+It derives the whole statement from the sources inside PostgreSQL (set-based, so it stays usable on millions of rows) and inserts missing rows, updates rows whose source changed (keeping their `id`), and deletes rows whose source no longer qualifies (voided payment, unpaid again, deleted). Re-running it changes nothing; run it after manual database edits to repair drift. It takes the same lock as cashflow/revenue writes, so it is safe while the API is running.
+
+## Loans
+
+`loans` records the loans taken by the business, `loan_installments` their repayment schedule and `loan_repayments` the money paid back. Every loan belongs to a lender (`lender_id`, see [Lenders](#lenders)); a new loan, or a loan moved to another lender, needs an active one. There are two types (`loan_type`):
+
+| | `SHORT_TERM` | `LONG_TERM` |
+| --- | --- | --- |
+| Installments | exactly one, for the whole principal | `term_months` monthly installments |
+| Due date | `due_date`: any date from the start date (e.g. one week later) | `first_due_date`, then the same day every month (the last day of shorter months) |
+| Interest | `interest_amount`: a flat IDR amount, 0 allowed. When a lender quotes a rate, enter the resulting amount | `annual_interest_rate` (fixed, percent per year) with `interest_method` |
+
+Each type only accepts its own fields (a rate on a short-term loan, or an interest amount on a long-term one, is a `422`). The long-term interest methods:
+
+- `FLAT` (bunga flat): principal / term plus interest on the **original** principal (principal x rate / 12) every month. 12,000,000 at 12 % for 12 months = 1,000,000 + 120,000 each month.
+- `ANNUITY` (bunga anuitas/efektif): the same installment every month, interest on the **outstanding** balance, so the interest part shrinks. 12,000,000 at 12 % for 12 months = 1,066,185 each month (the last one absorbs the rounding).
+
+Amounts are whole IDR and the principal parts always add up to the principal exactly.
+
+Every field can be edited, including the type. New terms regenerate the schedule and the existing repayments are re-allocated to it, so installment statuses and the loan status follow the edit (money never moves on an edit). An edit that would make the loan total (principal + interest of the new schedule) smaller than what has already been repaid is rejected with a `422` on `principal_amount` stating both amounts. A loan entered by mistake can be cancelled while it has no repayment.
+
+**Repayments.** The amount is entered manually. A repayment is applied to the oldest installment first and, within an installment, to its interest before its principal; whatever is left goes to the next installment, which becomes `PARTIALLY_PAID` (e.g. 1,500,000 on 1,120,000 installments: installment 1 `PAID`, installment 2 `PARTIALLY_PAID` with 380,000 paid and 740,000 still due). One repayment can therefore pay part of an installment or several of them. Without an `amount` it pays what is still due on the next installment. It cannot be in the future, before the loan starts, or more than what is still owed. The allocation is re-derived from all non-voided repayments (in payment date order) after every repayment or void, so every split stays consistent. A loan whose installments are all paid is `PAID_OFF`; voiding a repayment makes it `ACTIVE` again.
+
+Each repayment, in the same database transaction:
+
+- is a **debit** of the main cash account, posted like top-ups/transfers through the background queue with reference `loan_repayments:<id>:loan_repaid`; a void posts the offsetting credit (`loan_repayment_voided`). The daily audit reconciles repayments like the other sources;
+- appears in `cash_statements` as **one** `LOAN_REPAYMENT` debit for its full amount (e.g. `Loan repayment: Bank BRI KUR-001 (installments 2-3)`), reference `loans:<loan id>`, counterparty the lender. How much of it was principal and interest is kept on both the repayment (`principal_amount`/`interest_amount`, plus the installments it went to: `first_installment`/`last_installment`) and the installments (`principal_paid`/`interest_paid`); both are re-derived together and always add up to the same totals. A short-term loan's row has no installment suffix (`Loan repayment: Koperasi Maju`).
+
+| Method | Path | Access | Purpose |
+| --- | --- | --- | --- |
+| GET | `/api/v1/loans` | any active user | paginated, newest start first, each with its `lender` (`id`, `name`) and a `summary` (paid/outstanding principal and interest, next installment, overdue installments/amount); filters `loan_type`, `status`, `lender_id` |
+| GET | `/api/v1/loans/summary` | any active user | outstanding principal/interest, overdue amount and next due date of the active loans, in total and per loan type |
+| GET | `/api/v1/loans/{loan_id}` | any active user | one loan with its repayment schedule (`installments`: due date, principal, interest, paid, outstanding, status, overdue), its `repayments` (paid and voided) and audit log |
+| POST | `/api/v1/loans` | Superadmin | create a loan (short-term or long-term fields); its schedule is generated |
+| PATCH | `/api/v1/loans/{loan_id}` | Superadmin | edit; repayments are re-allocated, rejected below the repaid amount |
+| POST | `/api/v1/loans/{loan_id}/cancel` | Superadmin | cancel a loan without repayments, with a `reason` |
+| POST | `/api/v1/loans/{loan_id}/repayments` | Superadmin | record a repayment: `paid_date`, optional `amount`, `notes` |
+| PATCH | `/api/v1/loans/{loan_id}/repayments/{repayment_id}/void` | Superadmin | void a repayment with a `reason` |
+
+Receiving the loan money is not posted automatically: record it as a manual main account adjustment (`POST /api/v1/main-cash-account/adjustments`, `credit`). Long-term rates are fixed and installments monthly; an early payoff pays the scheduled interest in full.
+
+## Lenders
+
+`lenders` holds the banks, cooperatives or people the business borrows from. Only `name` is required; it is unique regardless of case (`Bank BRI` and `bank bri` are the same lender, a duplicate is a `409 LENDER_EXISTS`). `contact_person`, `phone`, `email`, `address` and `notes` are optional (blank values are stored as `null`). Lenders are never deleted: `is_active = false` keeps the lender and its loans but refuses new loans for it. Renaming a lender updates the cash statement rows of its loans.
+
+Each lender is returned with its **active** loans (paid-off and cancelled loans are not owed any more) and their totals, computed exactly like the loan `summary`:
+
+| Field | Meaning |
+| --- | --- |
+| `principal_amount`, `total_interest` | the full principal and the full scheduled interest |
+| `total_payable` | principal + interest |
+| `total_paid` | what has been repaid |
+| `principal_outstanding`, `interest_outstanding`, `total_outstanding` | what still has to be repaid |
+| `overdue_amount`, `next_installment` / `next_due_date` | what is late, and what comes next |
+
+| Method | Path | Access | Purpose |
+| --- | --- | --- | --- |
+| GET | `/api/v1/lenders` | any active user | paginated by name, each with `active_loans` and `active_loans_summary`; filters `search` (name or contact person), `is_active`, `has_active_loans` |
+| GET | `/api/v1/lenders/{lender_id}` | any active user | one lender with its active loans |
+| POST | `/api/v1/lenders` | Superadmin | create: `name` and optional fields |
+| PATCH | `/api/v1/lenders/{lender_id}` | Superadmin | edit, including `is_active` |
+
+Use `GET /api/v1/loans?lender_id=` for a lender's full loan history (including paid-off and cancelled loans).
 
 ## Lele biomass and average daily gain (ADG)
 

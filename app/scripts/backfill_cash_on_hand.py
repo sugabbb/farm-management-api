@@ -7,7 +7,8 @@ to repair drift):
 
 ``cash_on_hand``
     - ``MAIN_ACCOUNT_TOPUP`` with payment_status ``PAID`` adds ``amount_idr``.
-    - Any other cashflow type with payment_status ``PAID`` / ``PARTIALLY_PAID`` subtracts ``amount_idr``.
+    - Any other cashflow type subtracts what was actually paid: ``amount_idr`` when ``PAID``, the
+      sum of its non-voided payments when ``PARTIALLY_PAID``.
 
 ``waiting_approval``
     - Every cashflow whose approval_status is ``SUBMITTED`` adds ``amount_idr``.

@@ -28,7 +28,7 @@ from app.db.base import Base, TimestampMixin
 
 # A log reference is "<source table>:<source id>:<action>" for automatic entries and "manual:<note>"
 # otherwise; these expressions extract the source of an entry inside the database.
-SOURCE_REFERENCE_PATTERN = "^(operational_cashflows|revenues):[0-9]+:"
+SOURCE_REFERENCE_PATTERN = "^(operational_cashflows|revenues|loan_repayments):[0-9]+:"
 SOURCE_TABLE_SQL = f"CASE WHEN reference ~ '{SOURCE_REFERENCE_PATTERN}' THEN split_part(reference, ':', 1) END"
 SOURCE_ID_SQL = f"CASE WHEN reference ~ '{SOURCE_REFERENCE_PATTERN}' THEN split_part(reference, ':', 2)::bigint END"
 
@@ -448,7 +448,7 @@ class MainCashAccountEvent(Base):
 
     __tablename__ = "main_cash_account_events"
     __table_args__ = (
-        CheckConstraint("source_table IN ('operational_cashflows','revenues')", name="source"),
+        CheckConstraint("source_table IN ('operational_cashflows','revenues','loan_repayments')", name="source"),
         CheckConstraint("delta <> 0", name="delta"),
         Index("ix_main_cash_account_events_source", "source_table", "source_id"),
     )
@@ -492,6 +492,63 @@ class MainCashAccountAuditRun(Base):
     new_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 0))
     log_high_id: Mapped[int | None] = mapped_column(BigInteger)
     error: Mapped[str | None] = mapped_column(Text)
+
+
+class CashStatement(TimestampMixin, Base):
+    """One real cash movement of the business, bank-statement style (see cash_statement_service).
+
+    Derived read model built from three sources, never edited by hand:
+
+    - ``operational_cashflows`` (every type except ``MAIN_ACCOUNT_TOPUP``): a **debit** per amount
+      actually paid, once the cashflow is ``PARTIALLY_PAID``/``PAID``;
+    - ``revenues`` (every type except ``MAIN_ACCOUNT_TRANSFER``): a **credit** per amount actually
+      received, once the revenue is ``PARTIALLY_PAID``/``PAID``; for a paid
+      ``MAIN_ACCOUNT_TRANSFER`` only its transfer fee, as a **debit**;
+    - ``main_cash_account_logs``: the manual adjustments only, in their own direction.
+
+    A transaction paid in several parts has one row per payment, all with the same ``reference``.
+    """
+
+    __tablename__ = "cash_statements"
+    __table_args__ = (
+        CheckConstraint("direction IN ('credit','debit')", name="direction"),
+        CheckConstraint("amount > 0", name="amount"),
+        CheckConstraint(
+            "source_table IN ('operational_cashflows','revenues','main_cash_account_logs','loans')", name="source"
+        ),
+        CheckConstraint("(payment_id IS NULL) = (payment_sequence IS NULL)", name="payment"),
+        # One source transaction produces one row per payment (or one 'paid'/'fee'/'manual' row):
+        # source_line tells them apart and makes the sync idempotent.
+        UniqueConstraint("source_table", "source_id", "source_line"),
+        # Statement order and running balance.
+        Index("ix_cash_statements_date_id", "statement_date", "id"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    # The date the money actually moved: the payment date, the paid date of a transaction settled
+    # without payment rows (direct transfer, transfer fee), or the posting date of an adjustment.
+    statement_date: Mapped[date] = mapped_column(Date)
+    # credit = money in, debit = money out.
+    direction: Mapped[str] = mapped_column(String(10), index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    # The cashflow/revenue type, TRANSFER_FEE, MANUAL_ADJUSTMENT or LOAN_REPAYMENT.
+    category: Mapped[str] = mapped_column(String(40), index=True)
+    description: Mapped[str] = mapped_column(Text)
+    # Customer of a sale or employee of a salary, when known.
+    counterparty: Mapped[str | None] = mapped_column(String(255))
+    # "<source_table>:<source_id>": the same for every row of one transaction (e.g. its partial payments).
+    reference: Mapped[str] = mapped_column(String(80), index=True)
+    source_table: Mapped[str] = mapped_column(String(40))
+    source_id: Mapped[int] = mapped_column(BigInteger)
+    # "payment:<payment id>", "paid", "fee", "manual" or "repayment:<repayment id>".
+    source_line: Mapped[str] = mapped_column(String(60))
+    # The operational_cashflow_payments / revenue_payments / loan_repayments row and its number
+    # within the transaction.
+    payment_id: Mapped[int | None] = mapped_column(BigInteger)
+    payment_sequence: Mapped[int | None] = mapped_column(Integer)
+    # Details of the source transaction as it is now.
+    source_transaction_date: Mapped[date] = mapped_column(Date)
+    source_amount: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    source_payment_status: Mapped[str | None] = mapped_column(String(20))
 
 
 class Revenue(TimestampMixin, Base):
@@ -687,6 +744,162 @@ class LeleSamplingResult(TimestampMixin, Base):
     # May be negative: sampling 30 fish is noisy, and the data is shown as measured.
     weight_gain_g: Mapped[Decimal | None] = mapped_column(Numeric(12, 3))
     adg_g: Mapped[Decimal | None] = mapped_column(Numeric(12, 3))
+
+
+# --- Loans ------------------------------------------------------------------------------------
+# See app.features.loan_service. Repayments are debited from the main cash account and appear in
+# cash_statements.
+
+
+class Lender(TimestampMixin, Base):
+    """A bank, cooperative or person the business borrows from. Only the name is required."""
+
+    __tablename__ = "lenders"
+    __table_args__ = (
+        # "Bank BRI" and "bank bri" are the same lender.
+        Index("uq_lenders_name_lower", text("lower(name)"), unique=True),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    contact_person: Mapped[str | None] = mapped_column(String(255))
+    phone: Mapped[str | None] = mapped_column(String(50))
+    email: Mapped[str | None] = mapped_column(String(255))
+    address: Mapped[str | None] = mapped_column(Text)
+    notes: Mapped[str | None] = mapped_column(Text)
+    # An inactive lender keeps its loans but cannot receive new ones.
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+
+class Loan(TimestampMixin, Base):
+    """A loan taken by the business: its terms and, in ``installments``, its repayment schedule.
+
+    - ``SHORT_TERM``: a single installment due on ``first_due_date`` (any date from the start, e.g.
+      one week later), with a flat ``interest_amount`` in IDR (0 allowed) instead of a rate.
+    - ``LONG_TERM``: ``term_months`` monthly installments from ``first_due_date``, with interest from
+      ``annual_interest_rate`` and ``interest_method``.
+    """
+
+    __tablename__ = "loans"
+    __table_args__ = (
+        CheckConstraint("loan_type IN ('SHORT_TERM','LONG_TERM')", name="type"),
+        CheckConstraint(
+            "(loan_type = 'SHORT_TERM' AND interest_amount IS NOT NULL AND annual_interest_rate IS NULL"
+            " AND interest_method IS NULL AND term_months IS NULL)"
+            " OR (loan_type = 'LONG_TERM' AND interest_amount IS NULL AND annual_interest_rate IS NOT NULL"
+            " AND interest_method IS NOT NULL AND term_months IS NOT NULL)",
+            name="shape",
+        ),
+        CheckConstraint("interest_method IN ('FLAT','ANNUITY')", name="method"),
+        CheckConstraint("status IN ('ACTIVE','PAID_OFF','CANCELLED')", name="status"),
+        CheckConstraint("principal_amount > 0", name="principal"),
+        CheckConstraint("interest_amount >= 0", name="interest"),
+        CheckConstraint("annual_interest_rate >= 0 AND annual_interest_rate <= 100", name="rate"),
+        CheckConstraint("term_months BETWEEN 1 AND 600", name="term"),
+        CheckConstraint("first_due_date >= start_date", name="dates"),
+        CheckConstraint(
+            "(status = 'CANCELLED') = (cancelled_at IS NOT NULL)"
+            " AND (cancelled_at IS NULL) = (cancelled_by IS NULL)"
+            " AND (cancelled_at IS NULL) = (cancel_reason IS NULL)",
+            name="cancel",
+        ),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    lender_id: Mapped[int] = mapped_column(ForeignKey("lenders.id", ondelete="RESTRICT"), index=True)
+    # The lender's contract/account number.
+    reference_number: Mapped[str | None] = mapped_column(String(100))
+    loan_type: Mapped[str] = mapped_column(String(20), index=True)
+    principal_amount: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    # SHORT_TERM only: the flat interest in IDR, entered as an amount (0 allowed).
+    interest_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 0))
+    # LONG_TERM only: percent per year (e.g. 11.5 for 11.5 %), FLAT (interest on the original
+    # principal every month) or ANNUITY (equal installments on the declining balance), and the
+    # number of monthly installments.
+    annual_interest_rate: Mapped[Decimal | None] = mapped_column(Numeric(7, 4))
+    interest_method: Mapped[str | None] = mapped_column(String(10))
+    term_months: Mapped[int | None] = mapped_column(Integer)
+    # Date the loan was received/signed, and due date of the (first) installment.
+    start_date: Mapped[date] = mapped_column(Date, index=True)
+    first_due_date: Mapped[date] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(String(20), default="ACTIVE", index=True)
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    cancel_reason: Mapped[str | None] = mapped_column(Text)
+    installments: Mapped[list[LoanInstallment]] = relationship(
+        cascade="all, delete-orphan", order_by="LoanInstallment.sequence"
+    )
+    repayments: Mapped[list[LoanRepayment]] = relationship(order_by="(LoanRepayment.paid_date, LoanRepayment.id)")
+    lender: Mapped[Lender] = relationship()
+
+
+class LoanInstallment(TimestampMixin, Base):
+    """One monthly installment of a loan's schedule and how much of it has been repaid.
+
+    The schedule is generated from the loan terms; the paid amounts are re-derived from the
+    non-voided repayments after every repayment or void (oldest installment first, interest before
+    principal)."""
+
+    __tablename__ = "loan_installments"
+    __table_args__ = (
+        UniqueConstraint("loan_id", "sequence"),
+        CheckConstraint("status IN ('UNPAID','PARTIALLY_PAID','PAID')", name="status"),
+        CheckConstraint(
+            "principal_amount >= 0 AND interest_amount >= 0 AND principal_paid >= 0 AND interest_paid >= 0"
+            " AND principal_paid <= principal_amount AND interest_paid <= interest_amount",
+            name="amounts",
+        ),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    loan_id: Mapped[int] = mapped_column(ForeignKey("loans.id", ondelete="CASCADE"), index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    due_date: Mapped[date] = mapped_column(Date, index=True)
+    principal_amount: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    interest_amount: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    principal_paid: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    interest_paid: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    status: Mapped[str] = mapped_column(String(20), default="UNPAID", index=True)
+    # Date of the repayment that settled it.
+    paid_date: Mapped[date | None] = mapped_column(Date)
+
+
+class LoanRepayment(TimestampMixin, Base):
+    """Money paid back on a loan, out of the main cash account.
+
+    ``principal_amount`` + ``interest_amount`` = ``amount``: how the repayment was split, and the
+    installments it went to, are derived by the allocation (see loan_service) and refreshed after
+    every void or loan edit. The same split is kept per installment
+    (``loan_installments.principal_paid`` / ``interest_paid``)."""
+
+    __tablename__ = "loan_repayments"
+    __table_args__ = (
+        CheckConstraint(
+            "amount > 0 AND principal_amount >= 0 AND interest_amount >= 0"
+            " AND principal_amount + interest_amount = amount",
+            name="amounts",
+        ),
+        CheckConstraint(
+            "(voided_at IS NULL AND voided_by IS NULL AND void_reason IS NULL)"
+            " OR (voided_at IS NOT NULL AND voided_by IS NOT NULL AND void_reason IS NOT NULL)",
+            name="void",
+        ),
+        # Lets the main cash account audit run incrementally over repayments.
+        Index("ix_loan_repayments_updated", "updated_at", "id"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    loan_id: Mapped[int] = mapped_column(ForeignKey("loans.id", ondelete="RESTRICT"), index=True)
+    paid_date: Mapped[date] = mapped_column(Date, index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    principal_amount: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    interest_amount: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    # Sequences of the first and last installment this repayment went to.
+    first_installment: Mapped[int | None] = mapped_column(Integer)
+    last_installment: Mapped[int | None] = mapped_column(Integer)
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    voided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    voided_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    void_reason: Mapped[str | None] = mapped_column(Text)
 
 
 class AuditEvent(TimestampMixin, Base):

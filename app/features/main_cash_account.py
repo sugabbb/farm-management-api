@@ -14,8 +14,7 @@ from app.core.pagination import PageDep, StrictModel
 from app.db.models import MainCashAccount, MainCashAccountAuditRun, MainCashAccountLog
 from app.features.main_cash_account_events import pending_summary
 from app.features.main_cash_account_service import (
-    CASHFLOW_SOURCE,
-    REVENUE_SOURCE,
+    ROW_SOURCES,
     adjust,
     get_account,
     main_cash_account,
@@ -71,13 +70,17 @@ def list_main_cash_account_logs(
     db: DbSession,
     page: PageDep,
     direction: Literal["credit", "debit"] | None = None,
-    source: Literal["operational_cashflows", "revenues", "manual"] | None = None,
-    source_id: int | None = Query(default=None, description="Only with source=operational_cashflows or revenues."),
+    source: Literal["operational_cashflows", "revenues", "loan_repayments", "manual"] | None = None,
+    source_id: int | None = Query(
+        default=None, description="Only with source=operational_cashflows, revenues or loan_repayments."
+    ),
     from_date: date | None = Query(default=None, alias="from"),
     to_date: date | None = Query(default=None, alias="to"),
 ) -> dict[str, object]:
-    if source_id is not None and source not in (CASHFLOW_SOURCE, REVENUE_SOURCE):
-        raise validation("source_id", "source_id requires source=operational_cashflows or source=revenues.")
+    if source_id is not None and source not in ROW_SOURCES:
+        raise validation(
+            "source_id", "source_id requires source=operational_cashflows, source=revenues or source=loan_repayments."
+        )
     stmt = select(MainCashAccountLog)
     if direction:
         stmt = stmt.where(MainCashAccountLog.direction == direction)

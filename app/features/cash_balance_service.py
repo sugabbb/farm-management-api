@@ -6,11 +6,14 @@ approval/rejection, payment, or payment void) the affected balances are adjusted
 rather than recomputed from the full history, so the table always has exactly one up to date
 row per type.
 
-Rules implemented for ``cash_on_hand``:
+Rules implemented for ``cash_on_hand`` (the real cash on hand, i.e. only money that actually moved):
 
-- ``MAIN_ACCOUNT_TOPUP`` transactions add ``amount_idr`` to the balance directly.
-- Any other cashflow type reduces the balance by ``amount_idr`` once its ``payment_status``
-  becomes ``PAID`` or ``PARTIALLY_PAID``.
+- ``MAIN_ACCOUNT_TOPUP`` transactions add ``amount_idr`` to the balance once ``PAID``.
+- Any other cashflow type reduces the balance by what was actually paid on it: its full
+  ``amount_idr`` once ``PAID``, or only the sum of its non-voided payments while
+  ``PARTIALLY_PAID``. Each further payment therefore reduces the balance by its own amount, a
+  voided payment gives its amount back, and correcting the amount of a partially paid row does not
+  move the balance (no money moved).
 
 Rules implemented for ``waiting_approval``:
 
@@ -48,7 +51,6 @@ WAITING_APPROVAL = "waiting_approval"
 APPROVED_UNPAID = "approved_unpaid"
 BALANCE_TYPES = (CASH_ON_HAND, WAITING_APPROVAL, APPROVED_UNPAID)
 
-PAID_STATUSES = ("PAID", "PARTIALLY_PAID")
 WAITING_APPROVAL_STATUS = "SUBMITTED"
 APPROVED_STATUS = "APPROVED"
 
@@ -101,30 +103,47 @@ def get_or_create_balance(db: Session, balance_type: str) -> OperationalCashflow
     return balance
 
 
-def cashflow_effect(cashflow_type: str, payment_status: str, amount_idr: Decimal) -> Decimal:
+def cashflow_effect(cashflow_type: str, payment_status: str, amount_idr: Decimal, paid_amount_idr: Decimal) -> Decimal:
     """Returns the signed contribution of an operational cashflow transaction, in its current
-    persisted state, to the ``cash_on_hand`` balance.
+    persisted state, to the ``cash_on_hand`` balance: a paid top-up adds its amount, any other
+    type subtracts what was actually paid (the full amount once ``PAID``, only the non-voided
+    payments while ``PARTIALLY_PAID``).
     """
     if cashflow_type == "MAIN_ACCOUNT_TOPUP":
         return amount_idr if payment_status == "PAID" else Decimal("0")
-    return -amount_idr if payment_status in PAID_STATUSES else Decimal("0")
+    if payment_status == "PAID":
+        return -amount_idr
+    if payment_status == "PARTIALLY_PAID":
+        return -paid_amount_idr
+    return Decimal("0")
+
+
+def paid_amount_sql() -> ColumnElement[Decimal]:
+    """Sum of the non-voided payments of the outer ``operational_cashflows`` row."""
+    return (
+        select(func.coalesce(func.sum(OperationalCashflowPayment.amount_idr), Decimal("0")))
+        .where(
+            OperationalCashflowPayment.operational_cashflow_id == OperationalCashflow.id,
+            OperationalCashflowPayment.voided_at.is_(None),
+        )
+        .correlate(OperationalCashflow)
+        .scalar_subquery()
+    )
 
 
 def cashflow_effect_sql() -> ColumnElement[Decimal]:
     """SQL twin of :func:`cashflow_effect`, used to recalculate the balance from the whole
     ``operational_cashflows`` table in a single aggregate query. Keep both in sync.
     """
+    other_type = OperationalCashflow.cashflow_type != "MAIN_ACCOUNT_TOPUP"
     return case(
         (
             (OperationalCashflow.cashflow_type == "MAIN_ACCOUNT_TOPUP")
             & (OperationalCashflow.payment_status == "PAID"),
             OperationalCashflow.amount_idr,
         ),
-        (
-            (OperationalCashflow.cashflow_type != "MAIN_ACCOUNT_TOPUP")
-            & OperationalCashflow.payment_status.in_(PAID_STATUSES),
-            -OperationalCashflow.amount_idr,
-        ),
+        (other_type & (OperationalCashflow.payment_status == "PAID"), -OperationalCashflow.amount_idr),
+        (other_type & (OperationalCashflow.payment_status == "PARTIALLY_PAID"), -paid_amount_sql()),
         else_=Decimal("0"),
     )
 
@@ -154,17 +173,8 @@ def approved_unpaid_effect(approval_status: str, amount_idr: Decimal, paid_amoun
 
 def approved_unpaid_effect_sql() -> ColumnElement[Decimal]:
     """SQL twin of :func:`approved_unpaid_effect`. Keep both in sync."""
-    paid = (
-        select(func.coalesce(func.sum(OperationalCashflowPayment.amount_idr), Decimal("0")))
-        .where(
-            OperationalCashflowPayment.operational_cashflow_id == OperationalCashflow.id,
-            OperationalCashflowPayment.voided_at.is_(None),
-        )
-        .correlate(OperationalCashflow)
-        .scalar_subquery()
-    )
     return case(
-        (OperationalCashflow.approval_status == APPROVED_STATUS, OperationalCashflow.amount_idr - paid),
+        (OperationalCashflow.approval_status == APPROVED_STATUS, OperationalCashflow.amount_idr - paid_amount_sql()),
         else_=Decimal("0"),
     )
 
@@ -185,7 +195,7 @@ def calculate_balance(db: Session, effect: ColumnElement[Decimal]) -> tuple[Deci
 
 
 def calculate_cash_on_hand(db: Session) -> tuple[Decimal, int]:
-    """Counted transactions are paid top-ups and paid/partially-paid outflows."""
+    """Counted transactions are paid top-ups and outflows with money actually paid on them."""
     return calculate_balance(db, cashflow_effect_sql())
 
 
@@ -209,7 +219,7 @@ BALANCE_CALCULATORS = {
 def cash_on_hand_state_effect(state: CashflowState | None) -> Decimal:
     if state is None:
         return Decimal("0")
-    return cashflow_effect(state.cashflow_type, state.payment_status, state.amount_idr)
+    return cashflow_effect(state.cashflow_type, state.payment_status, state.amount_idr, state.paid_amount_idr)
 
 
 def waiting_approval_state_effect(state: CashflowState | None) -> Decimal:
@@ -234,7 +244,9 @@ def apply_delta(db: Session, balance_type: str, delta: Decimal) -> None:
 
 def sync_cash_on_hand(db: Session, before: CashflowState | None, after: CashflowState) -> None:
     """Applies the delta between the transaction's previous and current state to the
-    ``cash_on_hand`` balance. It only ever applies the net change, so it never double counts.
+    ``cash_on_hand`` balance. It only ever applies the net change, so it never double counts:
+    a partial payment subtracts its own amount, the payment that settles the row subtracts the
+    rest, and a void gives the voided amount back.
     """
     apply_delta(db, CASH_ON_HAND, cash_on_hand_state_effect(after) - cash_on_hand_state_effect(before))
 

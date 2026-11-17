@@ -1,9 +1,9 @@
 """Audit engine for the main cash account, used by the daily background command.
 
-It cross-checks ``main_cash_account_logs`` against its two sources in both directions:
+It cross-checks ``main_cash_account_logs`` against its sources in both directions:
 
-- every paid ``MAIN_ACCOUNT_TOPUP`` cashflow and paid ``MAIN_ACCOUNT_TRANSFER`` revenue must be
-  represented in the log by its signed effect (source -> log);
+- every paid ``MAIN_ACCOUNT_TOPUP`` cashflow, paid ``MAIN_ACCOUNT_TRANSFER`` revenue and non-voided
+  loan repayment must be represented in the log by its signed effect (source -> log);
 - every logged source entry must match a source row that still justifies it, so a log entry whose
   source was changed, unpaid again or deleted is corrected too (log -> source).
 
@@ -39,11 +39,12 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import BigInteger, ColumnElement, Integer, bindparam, case, func, insert, literal, select, text
+from sqlalchemy import BigInteger, ColumnElement, Integer, bindparam, case, func, insert, literal, select, text, true
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Session
 
 from app.db.models import (
+    LoanRepayment,
     MainCashAccount,
     MainCashAccountAuditRun,
     MainCashAccountEvent,
@@ -58,6 +59,7 @@ from app.features.main_cash_account_service import (
     CASHFLOW_SOURCE,
     CREDIT,
     DEBIT,
+    LOAN_REPAYMENT_SOURCE,
     REVENUE_SOURCE,
     TOPUP_TYPE,
     TRANSFER_TYPE,
@@ -89,8 +91,9 @@ class SourceSpec:
 
     name: str
     id_column: Any
-    type_column: Any
-    type_value: str
+    # The rows of the table that can affect the main account (matched by a partial index where the
+    # table is large). Only the type: a row that *stops* qualifying must still be audited.
+    scope: ColumnElement[bool]
     updated_column: Any
     effect: ColumnElement[Decimal]
 
@@ -100,8 +103,7 @@ def source_specs() -> tuple[SourceSpec, ...]:
         SourceSpec(
             name=CASHFLOW_SOURCE,
             id_column=OperationalCashflow.id,
-            type_column=OperationalCashflow.cashflow_type,
-            type_value=TOPUP_TYPE,
+            scope=OperationalCashflow.cashflow_type == TOPUP_TYPE,
             updated_column=OperationalCashflow.updated_at,
             # A paid top-up takes money out of the main account.
             effect=case(
@@ -112,11 +114,18 @@ def source_specs() -> tuple[SourceSpec, ...]:
         SourceSpec(
             name=REVENUE_SOURCE,
             id_column=Revenue.id,
-            type_column=Revenue.revenue_type,
-            type_value=TRANSFER_TYPE,
+            scope=Revenue.revenue_type == TRANSFER_TYPE,
             updated_column=Revenue.updated_at,
             # A paid (approved) transfer puts money into the main account.
             effect=case((Revenue.payment_status == "PAID", Revenue.amount_idr), else_=literal(Decimal("0"))),
+        ),
+        SourceSpec(
+            name=LOAN_REPAYMENT_SOURCE,
+            id_column=LoanRepayment.id,
+            scope=true(),
+            updated_column=LoanRepayment.updated_at,
+            # A repayment takes money out of the main account until it is voided.
+            effect=case((LoanRepayment.voided_at.is_(None), -LoanRepayment.amount), else_=literal(Decimal("0"))),
         ),
     )
 
@@ -175,9 +184,7 @@ def candidate_ids(db: Session, spec: SourceSpec, after: int, limit: int, window_
     """Next batch of source ids to check, from both sides: rows in the source table and rows the
     log refers to (so entries whose source vanished are audited too). Keyset paginated on id.
     """
-    source_side = select(spec.id_column.label("source_id")).where(
-        spec.type_column == spec.type_value, spec.id_column > after
-    )
+    source_side = select(spec.id_column.label("source_id")).where(spec.scope, spec.id_column > after)
     log_side = select(MainCashAccountLog.source_id.label("source_id")).where(
         MainCashAccountLog.source_table == spec.name, MainCashAccountLog.source_id > after
     )
@@ -201,7 +208,7 @@ def compare(db: Session, spec: SourceSpec, ids: Sequence[int]) -> list[Discrepan
     batch = bindparam("batch_ids", value=list(ids), type_=ARRAY(BigInteger))
     expected = (
         select(spec.id_column.label("source_id"), spec.effect.label("effect"))
-        .where(spec.type_column == spec.type_value, spec.id_column == func.any(batch))
+        .where(spec.scope, spec.id_column == func.any(batch))
         .subquery()
     )
     posted = select(MainCashAccountLog.source_id.label("source_id"), signed_log_amount().label("amount")).where(

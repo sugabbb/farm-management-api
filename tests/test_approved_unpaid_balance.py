@@ -269,7 +269,7 @@ def test_all_balances_stay_consistent_over_a_mixed_history(db: Session, actor: U
     # partial: 700 - 200 = 500, paid-then-voided: 300, unpaid went back to draft: 0
     assert stored(db) == Decimal("800")
     assert stored(db, WAITING_APPROVAL) == Decimal("50")
-    assert stored(db, CASH_ON_HAND) == Decimal("4300")  # 5000 - 700 (partially paid counts in full)
+    assert stored(db, CASH_ON_HAND) == Decimal("4800")  # 5000 - 200 (only the partial payment left the cash)
     assert_matches_recalculation(db)
 
 
