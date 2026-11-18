@@ -66,7 +66,7 @@ from app.scripts.backfill_main_cash_account import backfill_main_cash_account, m
 def topup_data(amount: str) -> dict[str, object]:
     return {
         "cashflow_type": "MAIN_ACCOUNT_TOPUP",
-        "transaction_date": date.today(),
+        "transaction_date": today_local(),
         "amount_idr": Decimal(amount),
         "details": {"notes": "Top up"},
     }
@@ -75,7 +75,7 @@ def topup_data(amount: str) -> dict[str, object]:
 def transfer_data(gross: str, cost: str = "0") -> dict[str, object]:
     return {
         "revenue_type": "MAIN_ACCOUNT_TRANSFER",
-        "transaction_date": date.today(),
+        "transaction_date": today_local(),
         "details": {"gross_amount_idr": Decimal(gross), "payment_cost_idr": Decimal(cost), "notes": None},
     }
 
@@ -180,7 +180,7 @@ def test_other_cashflow_types_never_touch_the_main_account(db: Session, actor: U
         db,
         {
             "cashflow_type": "UTILITY",
-            "transaction_date": date.today(),
+            "transaction_date": today_local(),
             "amount_idr": Decimal("300"),
             "details": {"description": "Electricity"},
         },
@@ -189,7 +189,7 @@ def test_other_cashflow_types_never_touch_the_main_account(db: Session, actor: U
     db.commit()
     submit_operational(db, row, actor)
     decide_operational(db, row, actor, "APPROVED", None)
-    pay_operational(db, row, actor, date.today(), "FULL", None)
+    pay_operational(db, row, actor, today_local(), "FULL", None)
     db.commit()
 
     assert logs(db) == []
@@ -237,7 +237,7 @@ def test_other_revenue_types_never_touch_the_main_account(db: Session, actor: Us
         db,
         {
             "revenue_type": "OTHER",
-            "transaction_date": date.today(),
+            "transaction_date": today_local(),
             "amount_idr": Decimal("500"),
             "payment_method": "CASH",
             "details": {"notes": "Sold sacks"},
@@ -245,7 +245,7 @@ def test_other_revenue_types_never_touch_the_main_account(db: Session, actor: Us
         actor,
     )
     db.commit()
-    pay_revenue(db, row, actor, date.today(), "FULL", None)
+    pay_revenue(db, row, actor, today_local(), "FULL", None)
     db.commit()
 
     assert logs(db) == []
@@ -255,14 +255,14 @@ def test_payment_endpoints_cannot_move_topups_or_transfers(db: Session, actor: U
     """The sync hooks live in save/decide only; these guards are why that is complete."""
     top = topup(db, actor, "100")
     with pytest.raises(AppError):
-        pay_operational(db, top, actor, date.today(), "FULL", None)
+        pay_operational(db, top, actor, today_local(), "FULL", None)
     db.rollback()
     with pytest.raises(AppError):
         submit_operational(db, top, actor)
     db.rollback()
     moved = approve_transfer(db, actor, transfer(db, actor, "100"))
     with pytest.raises(AppError):
-        pay_revenue(db, moved, actor, date.today(), "FULL", None)
+        pay_revenue(db, moved, actor, today_local(), "FULL", None)
     db.rollback()
 
     assert amount(db) == Decimal("0")
@@ -453,7 +453,7 @@ def test_api_logs_list_filters_and_detail(db: Session, actor: User, client: Test
 
 def test_api_existing_endpoints_populate_the_main_account(db: Session, client: TestClient) -> None:
     """Top-up and transfer done through the existing operational-cashflow / revenue endpoints."""
-    today = date.today().isoformat()
+    today = today_local().isoformat()
     created = client.post(
         "/api/v1/operational-cashflows",
         json={"cashflow_type": "MAIN_ACCOUNT_TOPUP", "transaction_date": today, "amount_idr": "700", "details": {}},

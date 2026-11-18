@@ -214,9 +214,37 @@ The cashflow debits explain the cash on hand: `cash_on_hand` = paid top-ups - th
 | --- | --- | --- | --- |
 | GET | `/api/v1/cash-statements` | any active user | paginated statement, newest first; each row has `debit`/`credit`, the running `balance` after it (over the whole statement, whatever the filters), `reference` and `source` details; filters `direction`, `category`, `reference`, `source_table` + `source_id`, `from`/`to` (statement dates) |
 
-### Population and sync
+### Population: nightly, not live
 
-Every write that moves money (cashflow/revenue create, update, correction, decision, payment, void; manual main account adjustment) replaces the rows of that one transaction inside the same database transaction, so the statement is never behind the API. Transactions that existed before the table was introduced are populated by a manual, idempotent backfill after `alembic upgrade head`:
+`cash_statements` feeds the finance module's reports (monthly cashflow, revenue performance, loans, journal), none of which read it synchronously from a write path, so unlike the balances in [Operational cashflow balances](#operational-cashflow-balances) and the [main cash account](#main-cash-account) it is **not** kept current inside the cashflow/revenue/loan write that changes its source: the API never waits for it, and the statement may be up to a day behind. It is synced once a day, one month at a time, from cron (the service has no scheduler):
+
+```cron
+# every day at 00:00, server time - see APP_TIMEZONE in the environment
+0 0 * * *  cd /srv/api && .venv/bin/python -m app.scripts.sync_cash_statements
+```
+
+**Which month.** By default the month of the job's start time **minus 30 minutes**, in `APP_TIMEZONE`. A run at 00:00 on 1 August reads 23:30 on 31 July and syncs **July** (whose last day just ended) instead of an August that has no data yet; a run that starts up to 30 minutes late lands on the same month, and every other night it is simply the current month. Nothing is skipped at the month boundary: changes made on the last day of a month are also in the next month's window (the one-day overlap under **Which data**). `--month YYYY-MM` syncs another month (e.g. to catch up a night that did not run); `--dry-run` reports without writing.
+
+**Which data.** Only that month's transactions are re-derived, never the whole history. A transaction is in the month's scope when:
+
+- money moved on it during the month (a payment, repayment, paid date or manual adjustment dated in it);
+- it, one of its payments/repayments, or its lender was changed during the month (`updated_at` from one day before the 1st, so a write around midnight is never lost between two months) - e.g. a payment of last month voided this month, or a correction;
+- it already has a statement row dated in the month (so a row whose source was deleted or moved away is removed).
+
+All rows of an in-scope transaction are rebuilt, whatever their date, so "partial payment 2" stays numbered across months; every other transaction is left alone. Changes none of these catch (e.g. a customer renamed long after its sales) are repaired by the backfill below.
+
+Midnight is deliberate: the sync takes the same advisory lock as every cashflow/revenue/loan write (so it briefly queues them behind it while it runs), and midnight is normally the quietest point of the day. Cron has no notion of `APP_TIMEZONE`; schedule the job in whatever timezone the server/cron actually runs in so it lines up with it (set the timezone of the host, or the job's `CRON_TZ`/systemd-timer `OnCalendar` timezone, to `APP_TIMEZONE`). The sync writes only differences (missing rows inserted, changed rows updated in place keeping their `id`, rows no longer justified deleted), so it is idempotent: running it twice, late, or by hand is harmless, and it is safe while the API is live.
+
+**Run history.** Every run (dry and failed runs included) is recorded in `cash_statement_sync_runs`: the month (`period_start`/`period_end`), `changed_since`, `status` (`RUNNING` -> `SUCCESS`/`FAILED`; a row left `RUNNING` means the process died), `dry_run`, `started_at`/`finished_at`, the transactions checked per source (`cashflows_checked`, `revenues_checked`, `adjustments_checked`, `loans_checked`, `transactions_checked`), the rows `rows_inserted`/`rows_updated`/`rows_deleted`, the month's statement once synced (`period_rows`, `period_credit`, `period_debit`) and the `error` of a failed run. There is no API for it; maintainers query the table directly, e.g.:
+
+```sql
+-- the last runs, and any night that failed or never finished
+SELECT id, period_start, status, dry_run, started_at, finished_at,
+       transactions_checked, rows_inserted, rows_updated, rows_deleted, error
+FROM cash_statement_sync_runs ORDER BY started_at DESC LIMIT 30;
+```
+
+**Backfill (whole history).** Transactions that existed before the table was introduced, or any other drift, are repaired on demand with the one-off backfill, which re-derives every transaction ever recorded, prints its report and is not recorded in `cash_statement_sync_runs`:
 
 ```bash
 python -m app.scripts.backfill_cash_statements --dry-run   # print what would change and the resulting totals
@@ -224,7 +252,55 @@ python -m app.scripts.backfill_cash_statements             # write it
 python -m app.scripts.backfill_cash_on_hand --type cash_on_hand   # once: recompute cash on hand with the partial payment rule
 ```
 
-It derives the whole statement from the sources inside PostgreSQL (set-based, so it stays usable on millions of rows) and inserts missing rows, updates rows whose source changed (keeping their `id`), and deletes rows whose source no longer qualifies (voided payment, unpaid again, deleted). Re-running it changes nothing; run it after manual database edits to repair drift. It takes the same lock as cashflow/revenue writes, so it is safe while the API is running.
+## Monthly cut-off
+
+The month-end close for the finance team: the month's figures for the finance journal report, aggregated from `cash_statements` and saved as a snapshot. It runs from cron at midnight at the end of every month (the service has no scheduler):
+
+```cron
+# 00:00 on the 1st of every month, server time (= APP_TIMEZONE, see the nightly sync above)
+0 0 1 * *  cd /srv/api && .venv/bin/python -m app.scripts.monthly_cutoff
+```
+
+Like the nightly sync, the month is read from the start time minus 30 minutes, so the run at 00:00 on 1 August closes **July**. It first syncs that month's cash statement (recorded in `cash_statement_sync_runs`, so the close never works on a statement that is up to a day behind), then computes everything **as of the month's last day** on a **cash basis**. It can share the minute with the nightly sync: both take the same lock and the sync is idempotent.
+
+| Figure | How |
+| --- | --- |
+| Actual cash | `cash_opening` + `opening_balances_in_period` + `cash_in` - `cash_out` = `cash_closing`. `cash_in`/`cash_out`: the month's statement credits/debits. `cash_opening`: the net of every statement row before the month plus the go-live opening balances (`financial_opening_balances`) effective before it |
+| Profit and loss | revenue = credits of `revenues` per category; operating expenses = debits of `operational_cashflows` per category; other expenses = main account transfer fees; finance costs = the **interest** part of the month's loan repayments; `net_profit` = revenue - expenses. `NON_PL` lines list the cash that is neither income nor expense (loan principal repaid, manual adjustments in/out) |
+| Outstanding loans | every loan not cancelled and started by the month end: principal/interest paid and outstanding, overdue installments, and what was repaid during the month, from the repayments dated up to the month end (allocated like the loan module) |
+| Receivables | per customer, what sales dated up to the month end still had to be paid then (sale amount - statement credits of that sale up to the month end), aged 0-30/31-60/61-90/over 90 days from the sale date. Direct-transfer sales not approved yet are `pending_verification`; rejected ones are ignored |
+| Categories | the month's statement rows grouped by direction, source table and category |
+
+**No double counting.** The business has one pool of money in several pockets (main cash account, operational cash on hand, sales cash not deposited yet); moves between pockets (top-ups, transfers) are not on the statement, so the statement's credits/debits are the business's cash movements. Therefore:
+
+- `cash_closing` never adds `main_cash_accounts.current_amount` or the `cash_on_hand` balance (parts of the same money). The only non-statement amounts added are the go-live opening balances, which no statement row covers (`opening_balances_total` shows how much of the closing they are). The main account's own opening balance is a manual adjustment, so it is already a statement row and is not added again;
+- a `LOAN_REPAYMENT` statement row is principal + interest: the P&L takes only the interest (from the loan allocation), never the row; the principal is `NON_PL`;
+- collections of receivables are the statement's credit rows of each sale, not `revenue_payments` counted again;
+- manual adjustments (opening balance, loan proceeds, bank fees entered by hand) are cash but cannot be classified as income or expense, so they are `NON_PL` lines.
+
+Every run checks that the P&L reconciles with the cash movement (`net_profit - loan principal + manual in - manual out = cash_in - cash_out`) and that the month's loan repayments match the statement's `LOAN_REPAYMENT` rows. A check that fails does not stop the close; it is saved in `warnings`.
+
+**Snapshots.** Every run saves a new, immutable snapshot: `monthly_cutoffs` (status, the sync run it used, warnings and the headline figures) with `monthly_cutoff_categories`, `monthly_cutoff_profit_loss`, `monthly_cutoff_loans` and `monthly_cutoff_receivables` (names are copied, so later renames do not change a closed month). The month's reported snapshot is the one with `is_latest` (at most one per month). Re-running a closed month after late or backdated entries (`--month YYYY-MM`) saves a new snapshot that becomes `is_latest`; the earlier ones are kept. A failed run is saved as `FAILED` with its `error` and never becomes `is_latest`. `--dry-run` computes and logs the figures without saving them. A month that has not ended cannot be closed (exit code 2).
+
+| Method | Path | Access | Purpose |
+| --- | --- | --- | --- |
+| GET | `/api/v1/monthly-cutoffs?year=YYYY&month=M` | `ADMIN`, `SUPERADMIN` | the reported close (`is_latest`) of **one** month: `period`, `revision` (how many times the month was closed; > 1 = restated), `generated_at`, `warnings`, `cash`, `profit_and_loss` (totals and `lines`), `loans` (totals and `items`), `receivables` (totals and `customers` with `aging`), `categories`. Amounts are whole-IDR strings |
+
+`year` (2000-2100) and `month` (1-12) are both required and may be given once only: there is no range, list or "all months" form, so one call always returns exactly one month (`?month=7&month=8` is a `422`). A month that has not been closed, or whose only runs failed, is a `404`. The endpoint only reads the saved snapshot; it never computes or closes a month (that is the cron job).
+
+Maintainers can also query the tables directly, e.g.:
+
+```sql
+-- the reported close of each month
+SELECT period_start, cash_opening, cash_in, cash_out, cash_closing, revenue, net_profit,
+       loan_principal_outstanding, receivables, warnings
+FROM monthly_cutoffs WHERE is_latest ORDER BY period_start DESC;
+
+-- its P&L, in report order
+SELECT section, line, amount FROM monthly_cutoff_profit_loss
+WHERE cutoff_id = (SELECT id FROM monthly_cutoffs WHERE is_latest AND period_start = '2026-07-01')
+ORDER BY position;
+```
 
 ## Loans
 
@@ -247,10 +323,10 @@ Every field can be edited, including the type. New terms regenerate the schedule
 
 **Repayments.** The amount is entered manually. A repayment is applied to the oldest installment first and, within an installment, to its interest before its principal; whatever is left goes to the next installment, which becomes `PARTIALLY_PAID` (e.g. 1,500,000 on 1,120,000 installments: installment 1 `PAID`, installment 2 `PARTIALLY_PAID` with 380,000 paid and 740,000 still due). One repayment can therefore pay part of an installment or several of them. Without an `amount` it pays what is still due on the next installment. It cannot be in the future, before the loan starts, or more than what is still owed. The allocation is re-derived from all non-voided repayments (in payment date order) after every repayment or void, so every split stays consistent. A loan whose installments are all paid is `PAID_OFF`; voiding a repayment makes it `ACTIVE` again.
 
-Each repayment, in the same database transaction:
+Each repayment:
 
-- is a **debit** of the main cash account, posted like top-ups/transfers through the background queue with reference `loan_repayments:<id>:loan_repaid`; a void posts the offsetting credit (`loan_repayment_voided`). The daily audit reconciles repayments like the other sources;
-- appears in `cash_statements` as **one** `LOAN_REPAYMENT` debit for its full amount (e.g. `Loan repayment: Bank BRI KUR-001 (installments 2-3)`), reference `loans:<loan id>`, counterparty the lender. How much of it was principal and interest is kept on both the repayment (`principal_amount`/`interest_amount`, plus the installments it went to: `first_installment`/`last_installment`) and the installments (`principal_paid`/`interest_paid`); both are re-derived together and always add up to the same totals. A short-term loan's row has no installment suffix (`Loan repayment: Koperasi Maju`).
+- is, in the same database transaction, a **debit** of the main cash account, posted like top-ups/transfers through the background queue with reference `loan_repayments:<id>:loan_repaid`; a void posts the offsetting credit (`loan_repayment_voided`). The daily audit reconciles repayments like the other sources;
+- appears in `cash_statements`, once the nightly sync picks it up (see [Population: nightly, not live](#population-nightly-not-live)), as **one** `LOAN_REPAYMENT` debit for its full amount (e.g. `Loan repayment: Bank BRI KUR-001 (installments 2-3)`), reference `loans:<loan id>`, counterparty the lender. How much of it was principal and interest is kept on both the repayment (`principal_amount`/`interest_amount`, plus the installments it went to: `first_installment`/`last_installment`) and the installments (`principal_paid`/`interest_paid`); both are re-derived together and always add up to the same totals. A short-term loan's row has no installment suffix (`Loan repayment: Koperasi Maju`).
 
 | Method | Path | Access | Purpose |
 | --- | --- | --- | --- |
@@ -267,7 +343,7 @@ Receiving the loan money is not posted automatically: record it as a manual main
 
 ## Lenders
 
-`lenders` holds the banks, cooperatives or people the business borrows from. Only `name` is required; it is unique regardless of case (`Bank BRI` and `bank bri` are the same lender, a duplicate is a `409 LENDER_EXISTS`). `contact_person`, `phone`, `email`, `address` and `notes` are optional (blank values are stored as `null`). Lenders are never deleted: `is_active = false` keeps the lender and its loans but refuses new loans for it. Renaming a lender updates the cash statement rows of its loans.
+`lenders` holds the banks, cooperatives or people the business borrows from. Only `name` is required; it is unique regardless of case (`Bank BRI` and `bank bri` are the same lender, a duplicate is a `409 LENDER_EXISTS`). `contact_person`, `phone`, `email`, `address` and `notes` are optional (blank values are stored as `null`). Lenders are never deleted: `is_active = false` keeps the lender and its loans but refuses new loans for it. Renaming a lender updates the cash statement rows of its loans once the nightly sync runs.
 
 Each lender is returned with its **active** loans (paid-off and cancelled loans are not owed any more) and their totals, computed exactly like the loan `summary`:
 

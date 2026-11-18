@@ -28,6 +28,7 @@ from app.features.cash_balance_service import (
     calculate_approved_unpaid,
     get_balance,
 )
+from app.features.common import today_local
 from app.features.finance_service import (
     decide_operational,
     pay_operational,
@@ -42,7 +43,7 @@ from app.scripts.backfill_cash_on_hand import backfill_approved_unpaid, backfill
 def topup(amount: str) -> dict[str, object]:
     return {
         "cashflow_type": "MAIN_ACCOUNT_TOPUP",
-        "transaction_date": date.today(),
+        "transaction_date": today_local(),
         "amount_idr": Decimal(amount),
         "details": {"notes": "Top up"},
     }
@@ -51,7 +52,7 @@ def topup(amount: str) -> dict[str, object]:
 def utility(amount: str, description: str = "Electricity bill") -> dict[str, object]:
     return {
         "cashflow_type": "UTILITY",
-        "transaction_date": date.today(),
+        "transaction_date": today_local(),
         "amount_idr": Decimal(amount),
         "details": {"description": description},
     }
@@ -89,7 +90,7 @@ def approved(db: Session, actor: User, amount: str, description: str = "Electric
 
 def pay(db: Session, actor: User, row: OperationalCashflow, amount: str | None = None) -> OperationalCashflow:
     mode = "FULL" if amount is None else "PARTIAL"
-    row = pay_operational(db, row, actor, date.today(), mode, None if amount is None else Decimal(amount))
+    row = pay_operational(db, row, actor, today_local(), mode, None if amount is None else Decimal(amount))
     db.commit()
     return row
 
@@ -289,7 +290,7 @@ def test_api_flow_updates_approved_unpaid(db: Session, actor: User, actor_passwo
         }
         transaction = {
             "cashflow_type": "UTILITY",
-            "transaction_date": date.today().isoformat(),
+            "transaction_date": today_local().isoformat(),
             "amount_idr": "1000",
             "details": {"description": "Electricity bill"},
         }
@@ -305,7 +306,7 @@ def test_api_flow_updates_approved_unpaid(db: Session, actor: User, actor_passwo
         payment = client.post(
             f"{base}/{cashflow_id}/payments",
             headers=headers,
-            json={"payment_mode": "PARTIAL", "paid_date": date.today().isoformat(), "amount_idr": "400"},
+            json={"payment_mode": "PARTIAL", "paid_date": today_local().isoformat(), "amount_idr": "400"},
         )
         assert payment.status_code == 201
         assert stored(db) == Decimal("600")

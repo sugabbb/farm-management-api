@@ -43,15 +43,30 @@ same for all rows of a transaction), ``source_table``/``source_id``/``source_lin
 ``source_payment_status`` of the transaction.
 
 Each rule is a SQL ``SELECT`` producing the statement rows of its source, so the table is written
-set-based: :func:`sync_cash_statements` replaces the rows of one source transaction inside the
-caller's transaction (called after every cashflow/revenue/adjustment write), and
-:func:`rebuild_cash_statements` does the same for the whole table (the backfill command). Both are
-idempotent: a row whose values did not change is left untouched (its ``id`` is stable), rows whose
-source no longer qualifies (voided payment, corrected amount, ...) are updated or deleted.
+set-based by :func:`apply_sync`, either for every transaction or for a :class:`SyncScope` (a list
+of transactions per source; all of their rows). It is idempotent: a row whose values did not change
+is left untouched (its ``id`` is stable), rows whose source no longer qualifies (voided payment,
+corrected amount, ...) are updated or deleted.
+
+Unlike the cash on hand/approved-unpaid balances and the main cash account log, this table is
+**not** kept current inside the request that changes a source: nothing reads it from a write path,
+so the API does not wait for it. Two entry points populate it:
+
+- :func:`sync_period`, the nightly job (``app.scripts.sync_cash_statements``, cron at midnight in
+  ``APP_TIMEZONE``): one month only - the transactions :func:`period_scope` finds for it, never the
+  whole history. Each run is recorded in ``cash_statement_sync_runs``
+  (``app.features.cash_statement_sync``);
+- :func:`rebuild_cash_statements`, the one-off backfill (``app.scripts.backfill_cash_statements``):
+  every transaction ever recorded, after ``alembic upgrade head`` or to repair drift.
+
+Both take the same advisory lock as the writes, so they are safe while the API is live, and both
+are idempotent. The finance/monthly-report module that reads this table tolerates the statement
+being up to a day behind the source transactions.
 """
 
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -67,6 +82,7 @@ from sqlalchemy import (
     String,
     Text,
     and_,
+    bindparam,
     case,
     cast,
     delete,
@@ -77,7 +93,7 @@ from sqlalchemy import (
     select,
     union_all,
 )
-from sqlalchemy.dialects.postgresql import aggregate_order_by, insert
+from sqlalchemy.dialects.postgresql import ARRAY, aggregate_order_by, insert
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -283,11 +299,11 @@ def cashflow_base() -> tuple[Select[Any], Expression, Expression]:
     return stmt, description, Employee.name
 
 
-def cashflow_rules(source_id: int | None) -> list[Select[Any]]:
+def cashflow_rules(ids: Sequence[int] | None) -> list[Select[Any]]:
     cashflow, payment = OperationalCashflow, OperationalCashflowPayment
     base, description, counterparty = cashflow_base()
-    if source_id is not None:
-        base = base.where(cashflow.id == source_id)
+    if ids is not None:
+        base = base.where(id_in(cashflow.id, ids))
     source = {
         "category": cashflow.cashflow_type,
         "counterparty": counterparty,
@@ -333,7 +349,7 @@ def cashflow_rules(source_id: int | None) -> list[Select[Any]]:
 # --- Rules: revenues ----------------------------------------------------------------------------
 
 
-def revenue_rules(source_id: int | None) -> list[Select[Any]]:
+def revenue_rules(ids: Sequence[int] | None) -> list[Select[Any]]:
     revenue, payment, transfer = Revenue, RevenuePayment, RevenueTransferDetail
     other, fish = RevenueOtherDetail, RevenueFishDetail
     description = case(
@@ -349,8 +365,8 @@ def revenue_rules(source_id: int | None) -> list[Select[Any]]:
         .outerjoin(fish, fish.revenue_id == revenue.id)
         .outerjoin(transfer, transfer.revenue_id == revenue.id)
     )
-    if source_id is not None:
-        base = base.where(revenue.id == source_id)
+    if ids is not None:
+        base = base.where(id_in(revenue.id, ids))
     source = {
         "counterparty": Customer.name,
         "reference": reference(REVENUE_SOURCE, revenue.id),
@@ -410,7 +426,7 @@ def revenue_rules(source_id: int | None) -> list[Select[Any]]:
 # --- Rules: main cash account adjustments -------------------------------------------------------
 
 
-def manual_rule(source_id: int | None) -> Select[Any]:
+def manual_rule(ids: Sequence[int] | None) -> Select[Any]:
     log = MainCashAccountLog
     prefix = f"{MANUAL_SOURCE}:"
     posted_on = local_date(log.created_at)
@@ -429,13 +445,13 @@ def manual_rule(source_id: int | None) -> Select[Any]:
             source_amount=log.amount,
         )
     ).where(func.starts_with(log.reference, prefix))
-    return stmt.where(log.id == source_id) if source_id is not None else stmt
+    return stmt.where(id_in(log.id, ids)) if ids is not None else stmt
 
 
 # --- Rules: loan repayments ---------------------------------------------------------------------
 
 
-def loan_rules(source_id: int | None) -> list[Select[Any]]:
+def loan_rules(ids: Sequence[int] | None) -> list[Select[Any]]:
     loan, repayment = Loan, LoanRepayment
     lender = Lender.name + func.coalesce(literal(" ") + func.nullif(loan.reference_number, ""), "")
     first, last = cast(repayment.first_installment, String), cast(repayment.last_installment, String)
@@ -476,20 +492,50 @@ def loan_rules(source_id: int | None) -> list[Select[Any]]:
         )
         .where(repayment.voided_at.is_(None))
     )
-    return [stmt.where(repayment.loan_id == source_id) if source_id is not None else stmt]
+    # Scoped by loan, so the repayment sequence is still numbered over all of a loan's repayments.
+    return [stmt.where(id_in(repayment.loan_id, ids)) if ids is not None else stmt]
 
 
-def expected_statements(source_table: str | None = None, source_id: int | None = None) -> CompoundSelect[Any]:
-    """Every statement row the sources currently justify, optionally only those of one source row."""
+@dataclass(frozen=True)
+class SyncScope:
+    """The source transactions a sync is limited to: ids per source table. A table missing from
+    ``ids`` (or with no ids) is not touched at all."""
+
+    ids: Mapping[str, Sequence[int]]
+
+    def __post_init__(self) -> None:
+        unknown = set(self.ids) - set(SOURCES)
+        if unknown:
+            raise ValueError(f"unknown cash statement sources {sorted(unknown)}")
+
+    def of(self, source_table: str) -> Sequence[int]:
+        return self.ids.get(source_table, ())
+
+    @property
+    def total(self) -> int:
+        return sum(len(ids) for ids in self.ids.values())
+
+
+def id_in(column: Expression, ids: Sequence[int]) -> ColumnElement[bool]:
+    """``column = ANY(:ids)``: one array parameter instead of thousands of expanded IN parameters."""
+    return column == func.any(bindparam("ids", value=list(ids), type_=ARRAY(BigInteger), unique=True))
+
+
+def expected_statements(scope: SyncScope | None = None) -> CompoundSelect[Any]:
+    """Every statement row the sources currently justify; with a ``scope``, only the rows of the
+    transactions in it (all of their rows, whatever their date). The scope must not be empty."""
     rules: list[Select[Any]] = []
-    if source_table in (None, CASHFLOW_SOURCE):
-        rules.extend(cashflow_rules(source_id))
-    if source_table in (None, REVENUE_SOURCE):
-        rules.extend(revenue_rules(source_id))
-    if source_table in (None, LOG_SOURCE):
-        rules.append(manual_rule(source_id))
-    if source_table in (None, LOAN_SOURCE):
-        rules.extend(loan_rules(source_id))
+    builders: tuple[tuple[str, Callable[[Sequence[int] | None], list[Select[Any]]]], ...] = (
+        (CASHFLOW_SOURCE, cashflow_rules),
+        (REVENUE_SOURCE, revenue_rules),
+        (LOG_SOURCE, lambda ids: [manual_rule(ids)]),
+        (LOAN_SOURCE, loan_rules),
+    )
+    for source_table, build in builders:
+        if scope is None:
+            rules.extend(build(None))
+        elif scope.of(source_table):
+            rules.extend(build(scope.of(source_table)))
     return union_all(*rules)
 
 
@@ -510,19 +556,28 @@ class SyncPlan:
         return bool(self.inserted or self.updated or self.deleted)
 
 
-def source_filter(source_table: str | None, source_id: int | None) -> list[ColumnElement[bool]]:
-    if source_table is None:
+def source_filter(scope: SyncScope | None) -> list[ColumnElement[bool]]:
+    """The stored rows a sync may touch: all of them, or those of the transactions in ``scope``."""
+    if scope is None:
         return []
-    if source_table not in SOURCES:
-        raise ValueError(f"unknown cash statement source {source_table!r}")
-    return [CashStatement.source_table == source_table, CashStatement.source_id == source_id]
+    return [
+        or_(
+            *(
+                and_(CashStatement.source_table == source_table, id_in(CashStatement.source_id, ids))
+                for source_table, ids in scope.ids.items()
+                if ids
+            )
+        )
+    ]
 
 
-def plan_sync(db: Session, source_table: str | None = None, source_id: int | None = None) -> SyncPlan:
+def plan_sync(db: Session, scope: SyncScope | None = None) -> SyncPlan:
     """Compares the expected rows with the stored ones inside PostgreSQL (FULL OUTER JOIN) and
     returns only the counts, so nothing but the numbers is loaded into Python."""
-    expected = expected_statements(source_table, source_id).subquery("expected")
-    existing = select(CashStatement).where(*source_filter(source_table, source_id)).subquery("existing")
+    if scope is not None and not scope.total:
+        return SyncPlan(0, 0, 0)
+    expected = expected_statements(scope).subquery("expected")
+    existing = select(CashStatement).where(*source_filter(scope)).subquery("existing")
     key_match = and_(*(expected.c[name] == existing.c[name] for name in KEY_COLUMNS))
     differs = or_(*(expected.c[name].is_distinct_from(existing.c[name]) for name in VALUE_COLUMNS))
     inserted, updated, deleted = db.execute(
@@ -535,10 +590,12 @@ def plan_sync(db: Session, source_table: str | None = None, source_id: int | Non
     return SyncPlan(int(inserted), int(updated), int(deleted))
 
 
-def apply_sync(db: Session, source_table: str | None = None, source_id: int | None = None) -> None:
+def apply_sync(db: Session, scope: SyncScope | None = None) -> None:
     """Upserts the expected rows (touching only those whose values changed) and deletes the stored
     rows that are no longer expected. Set-based: two statements whatever the row count."""
-    expected = expected_statements(source_table, source_id)
+    if scope is not None and not scope.total:
+        return
+    expected = expected_statements(scope)
     upsert = insert(CashStatement).from_select(list(COLUMNS), expected)
     db.execute(
         upsert.on_conflict_do_update(
@@ -552,21 +609,9 @@ def apply_sync(db: Session, source_table: str | None = None, source_id: int | No
     still_expected = expected.subquery("expected")
     db.execute(
         delete(CashStatement)
-        .where(*source_filter(source_table, source_id))
+        .where(*source_filter(scope))
         .where(~exists().where(*(still_expected.c[name] == getattr(CashStatement, name) for name in KEY_COLUMNS)))
     )
-
-
-def sync_cash_statements(db: Session, source_table: str, source_id: int) -> None:
-    """Brings the statement rows of one source transaction up to date, in the caller's transaction.
-
-    Call it after every write that can move money: cashflow/revenue create, update, correction,
-    decision, payment and void, and manual main account adjustments. It only writes the rows of
-    that source, so it is cheap and never conflicts with the sync of another source. The session
-    is flushed first so the rules see the pending changes.
-    """
-    db.flush()
-    apply_sync(db, source_table, source_id)
 
 
 @dataclass(frozen=True)
@@ -605,7 +650,8 @@ class RebuildResult:
 
 
 def rebuild_cash_statements(db: Session, *, dry_run: bool = False) -> RebuildResult:
-    """Populates/repairs the whole table from every source (the backfill command).
+    """Populates/repairs the whole table from every source (the one-off
+    ``app.scripts.backfill_cash_statements``; the nightly job uses :func:`sync_period` instead).
 
     Takes the same transactional lock as cashflow/revenue writes so it sees a consistent picture
     while the API is live. Commits unless ``dry_run`` (then rolls back after reporting what would
@@ -621,6 +667,212 @@ def rebuild_cash_statements(db: Session, *, dry_run: bool = False) -> RebuildRes
         else:
             db.commit()
         return RebuildResult(plan, totals, dry_run)
+    except Exception:
+        db.rollback()
+        raise
+
+
+# --- Monthly sync (the nightly job) -------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Period:
+    """A calendar month, in ``APP_TIMEZONE``: the unit the nightly sync works on."""
+
+    start: date
+
+    def __post_init__(self) -> None:
+        if self.start.day != 1:
+            raise ValueError("a period starts on the first day of a month")
+
+    @classmethod
+    def month_of(cls, day: date) -> Period:
+        return cls(day.replace(day=1))
+
+    @classmethod
+    def parse(cls, value: str) -> Period:
+        """``YYYY-MM``."""
+        try:
+            year, month = (int(part) for part in value.split("-"))
+            return cls(date(year, month, 1))
+        except ValueError as exc:
+            raise ValueError(f"expected a month as YYYY-MM, got {value!r}") from exc
+
+    @property
+    def next_start(self) -> date:
+        return date(self.start.year + self.start.month // 12, self.start.month % 12 + 1, 1)
+
+    @property
+    def end(self) -> date:
+        return self.next_start - timedelta(days=1)
+
+    @property
+    def label(self) -> str:
+        return f"{self.start:%Y-%m}"
+
+    @property
+    def starts_at(self) -> datetime:
+        """Local midnight of the first day."""
+        return datetime.combine(self.start, time.min, tzinfo=settings.timezone)
+
+    @property
+    def ends_at(self) -> datetime:
+        """Local midnight of the first day of the next month (exclusive)."""
+        return datetime.combine(self.next_start, time.min, tzinfo=settings.timezone)
+
+    @property
+    def changed_since(self) -> datetime:
+        """Source changes from this moment on are in scope: the month plus one day before it, so a
+        write committed just around midnight of the last run of the previous month is never lost
+        between two runs."""
+        return self.starts_at - CHANGE_OVERLAP
+
+
+# See Period.changed_since.
+CHANGE_OVERLAP = timedelta(days=1)
+
+
+# How far back from the job's start time the month is read (see nightly_period).
+NIGHTLY_LOOKBACK = timedelta(minutes=30)
+
+
+def nightly_period(started_at: datetime) -> Period:
+    """The month a run started at ``started_at`` syncs: the month of ``started_at - 30 minutes``,
+    in ``APP_TIMEZONE``.
+
+    The job is scheduled at 00:00, when the day (and on the 1st, the month) has only just started
+    and has no data yet. Reading the month half an hour earlier makes the run at 00:00 on 1 August
+    sync July (23:30 on 31 July) - the month whose last day just ended - instead of an August that
+    is still empty; every other night it is simply the current month. A run that starts a little
+    late (up to 30 minutes) still lands on the same month."""
+    if started_at.tzinfo is None:
+        raise ValueError("started_at must be timezone-aware")
+    return Period.month_of((started_at.astimezone(settings.timezone) - NIGHTLY_LOOKBACK).date())
+
+
+def period_scope(db: Session, period: Period) -> SyncScope:
+    """The transactions of ``period``, per source table. A transaction is in scope when:
+
+    - money moved on it during the month (a payment, repayment, paid date or adjustment dated in
+      it) - the rows the month's statement should have;
+    - it, or one of its payments/repayments (or its lender), was changed during the month
+      (``updated_at`` since :attr:`Period.changed_since`) - e.g. a payment of last month voided
+      this month, or a correction - so the month's edits reach the statement whatever their date;
+    - it already has a statement row dated in the month - so a row whose source disappeared or
+      moved away is removed.
+
+    Only indexed lookups of ids: the rules themselves then run for these transactions only, and
+    for all of their rows (so e.g. "partial payment 2" is still numbered across months).
+    """
+    first, last, since = period.start, period.end, period.changed_since
+    until = period.ends_at
+
+    def on_statement(source_table: str) -> Select[Any]:
+        return select(CashStatement.source_id).where(
+            CashStatement.source_table == source_table, CashStatement.statement_date.between(first, last)
+        )
+
+    def paid_in_month(paid_at: Any, transaction_date: Any) -> ColumnElement[bool]:
+        # Same date as paid_date(): the local date of paid_at, else the transaction date.
+        return or_(
+            and_(paid_at >= period.starts_at, paid_at < until),
+            and_(paid_at.is_(None), transaction_date.between(first, last)),
+        )
+
+    def ids(*parts: Select[Any]) -> list[int]:
+        union = parts[0].union(*parts[1:]).subquery()
+        return [int(value) for value in db.scalars(select(union.c[0]).order_by(union.c[0])).all()]
+
+    cashflow, cashflow_payment = OperationalCashflow, OperationalCashflowPayment
+    revenue, revenue_payment = Revenue, RevenuePayment
+    log, loan, repayment = MainCashAccountLog, Loan, LoanRepayment
+    payment_touched = or_(cashflow_payment.paid_date.between(first, last), cashflow_payment.updated_at >= since)
+    revenue_payment_touched = or_(revenue_payment.paid_date.between(first, last), revenue_payment.updated_at >= since)
+    return SyncScope(
+        {
+            CASHFLOW_SOURCE: ids(
+                select(cashflow_payment.operational_cashflow_id)
+                .join(cashflow, cashflow.id == cashflow_payment.operational_cashflow_id)
+                .where(payment_touched, cashflow.cashflow_type != TOPUP_TYPE),
+                select(cashflow.id).where(
+                    cashflow.cashflow_type != TOPUP_TYPE,
+                    or_(cashflow.updated_at >= since, paid_in_month(cashflow.paid_at, cashflow.transaction_date)),
+                ),
+                on_statement(CASHFLOW_SOURCE),
+            ),
+            REVENUE_SOURCE: ids(
+                select(revenue_payment.revenue_id).where(revenue_payment_touched),
+                select(revenue.id).where(
+                    or_(revenue.updated_at >= since, paid_in_month(revenue.paid_at, revenue.transaction_date))
+                ),
+                on_statement(REVENUE_SOURCE),
+            ),
+            # Log entries are immutable: posted in the month (or its overlap) is the only change.
+            LOG_SOURCE: ids(
+                select(log.id).where(func.starts_with(log.reference, f"{MANUAL_SOURCE}:"), log.created_at >= since),
+                on_statement(LOG_SOURCE),
+            ),
+            LOAN_SOURCE: ids(
+                select(repayment.loan_id).where(
+                    or_(repayment.paid_date.between(first, last), repayment.updated_at >= since)
+                ),
+                select(loan.id).where(loan.updated_at >= since),
+                # A renamed lender changes the description/counterparty of all of its loans' rows.
+                select(loan.id).join(Lender, Lender.id == loan.lender_id).where(Lender.updated_at >= since),
+                on_statement(LOAN_SOURCE),
+            ),
+        }
+    )
+
+
+@dataclass(frozen=True)
+class PeriodTotals:
+    rows: int
+    credit: Decimal
+    debit: Decimal
+
+
+def period_totals(db: Session, period: Period) -> PeriodTotals:
+    """Row count and money in/out of the month's statement."""
+    rows, credit, debit = db.execute(
+        select(
+            func.count(),
+            func.coalesce(func.sum(CashStatement.amount).filter(CashStatement.direction == CREDIT), Decimal("0")),
+            func.coalesce(func.sum(CashStatement.amount).filter(CashStatement.direction == DEBIT), Decimal("0")),
+        ).where(CashStatement.statement_date.between(period.start, period.end))
+    ).one()
+    return PeriodTotals(int(rows), Decimal(credit), Decimal(debit))
+
+
+@dataclass(frozen=True)
+class PeriodSyncResult:
+    period: Period
+    scope: SyncScope
+    plan: SyncPlan
+    totals: PeriodTotals
+    dry_run: bool
+
+
+def sync_period(db: Session, period: Period, *, dry_run: bool = False) -> PeriodSyncResult:
+    """Brings the statement rows of ``period``'s transactions (see :func:`period_scope`) up to date:
+    the engine of the nightly ``app.scripts.sync_cash_statements``.
+
+    Same lock, idempotency and dry-run behaviour as :func:`rebuild_cash_statements`, but it derives
+    only the month's transactions instead of every transaction ever recorded. Rows of those
+    transactions dated in other months are brought up to date too (their numbering and details
+    depend on the whole transaction), everything else is left alone.
+    """
+    try:
+        lock_balances(db)
+        scope = period_scope(db, period)
+        plan = plan_sync(db, scope)
+        apply_sync(db, scope)
+        totals = period_totals(db, period)
+        if dry_run:
+            db.rollback()
+        else:
+            db.commit()
+        return PeriodSyncResult(period, scope, plan, totals, dry_run)
     except Exception:
         db.rollback()
         raise

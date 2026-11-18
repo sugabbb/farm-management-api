@@ -56,3 +56,16 @@ def superadmin(user: ActiveUser) -> User:
 
 
 Superadmin = Annotated[User, Depends(superadmin)]
+
+# Listed explicitly (today these are all the roles), so a role added later does not silently get
+# access to the finance figures.
+FINANCE_ROLES = frozenset({"ADMIN", "SUPERADMIN"})
+
+
+def finance_reader(user: ActiveUser) -> User:
+    if user.role not in FINANCE_ROLES:
+        raise forbidden()
+    return user
+
+
+FinanceReader = Annotated[User, Depends(finance_reader)]

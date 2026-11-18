@@ -9,7 +9,7 @@ advisory locks).
 """
 
 import os
-from datetime import date, timedelta
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
@@ -26,7 +26,7 @@ from app.db.models import (
     User,
 )
 from app.db.session import engine
-from app.features.common import now_utc
+from app.features.common import now_utc, today_local
 from app.features.finance_service import decide_revenue, save_operational, save_revenue, submit_revenue
 from app.features.main_cash_account_audit import (
     FULL,
@@ -52,7 +52,7 @@ def topup(db: Session, actor: User, value: str) -> OperationalCashflow:
         db,
         {
             "cashflow_type": "MAIN_ACCOUNT_TOPUP",
-            "transaction_date": date.today(),
+            "transaction_date": today_local(),
             "amount_idr": Decimal(value),
             "details": {"notes": "Top up"},
         },
@@ -68,7 +68,7 @@ def transfer(db: Session, actor: User, gross: str, cost: str = "0") -> Revenue:
         db,
         {
             "revenue_type": "MAIN_ACCOUNT_TRANSFER",
-            "transaction_date": date.today(),
+            "transaction_date": today_local(),
             "details": {"gross_amount_idr": Decimal(gross), "payment_cost_idr": Decimal(cost), "notes": None},
         },
         actor,
@@ -158,7 +158,7 @@ def test_audit_posts_a_source_row_the_live_sync_never_saw(db: Session, actor: Us
         OperationalCashflow(
             cashflow_type="MAIN_ACCOUNT_TOPUP",
             direction="INFLOW",
-            transaction_date=date.today(),
+            transaction_date=today_local(),
             amount_idr=Decimal("777"),
             approval_status="NOT_REQUIRED",
             payment_status="PAID",

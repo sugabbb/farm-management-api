@@ -21,7 +21,6 @@ from sqlalchemy.orm import Session
 
 from app.core.errors import conflict, not_found, validation
 from app.db.models import Lender, Loan, User
-from app.features.cash_statement_service import LOAN_SOURCE, sync_cash_statements
 from app.features.common import audit, model_snapshot, today_local
 from app.features.farm_service import lock_balances
 from app.features.loan_service import ACTIVE, ZERO, LoanSummary, loan_query, summarize
@@ -69,8 +68,9 @@ def create_lender(db: Session, data: dict[str, Any], actor: User) -> Lender:
 
 
 def update_lender(db: Session, lender_id: int, data: dict[str, Any], actor: User) -> Lender:
-    """Edits a lender. A new name is shown on the cash statements of its loans immediately."""
-    # Same lock as loan writes, so the statements of its loans are refreshed consistently.
+    """Edits a lender. A new name is shown on the cash statements of its loans once the nightly
+    sync runs (see app.scripts.sync_cash_statements)."""
+    # Same lock as loan writes, so a concurrent loan write never races this rename.
     lock_balances(db)
     lender = db.scalar(select(Lender).where(Lender.id == lender_id).with_for_update())
     if lender is None:
@@ -78,12 +78,8 @@ def update_lender(db: Session, lender_id: int, data: dict[str, Any], actor: User
     name = clean_name(data["name"])
     assert_unique_name(db, name, exclude_id=lender.id)
     before = model_snapshot(lender)
-    renamed = name != lender.name
     apply_input(lender, data, name)
     audit(db, lender, "lender_updated", actor, before=before)
-    if renamed:
-        for loan_id in db.scalars(select(Loan.id).where(Loan.lender_id == lender.id)).all():
-            sync_cash_statements(db, LOAN_SOURCE, loan_id)
     return lender
 
 

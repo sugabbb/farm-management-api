@@ -13,7 +13,6 @@ import os
 import threading
 import time
 from collections.abc import Callable
-from datetime import date
 from decimal import Decimal
 
 import pytest
@@ -23,6 +22,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import MainCashAccountEvent, MainCashAccountLog, User
 from app.db.session import SessionLocal, engine
+from app.features.common import today_local
 from app.features.farm_service import ADVISORY_LOCK
 from app.features.finance_service import decide_revenue, save_operational, save_revenue, submit_revenue
 from app.features.main_cash_account_audit import audit_main_cash_account
@@ -35,7 +35,7 @@ from app.scripts.main_cash_account_worker import main as worker_main
 def topup_data(value: str) -> dict[str, object]:
     return {
         "cashflow_type": "MAIN_ACCOUNT_TOPUP",
-        "transaction_date": date.today(),
+        "transaction_date": today_local(),
         "amount_idr": Decimal(value),
         "details": {"notes": "Top up"},
     }
@@ -44,7 +44,7 @@ def topup_data(value: str) -> dict[str, object]:
 def transfer_data(gross: str) -> dict[str, object]:
     return {
         "revenue_type": "MAIN_ACCOUNT_TRANSFER",
-        "transaction_date": date.today(),
+        "transaction_date": today_local(),
         "details": {"gross_amount_idr": Decimal(gross), "payment_cost_idr": Decimal("0"), "notes": None},
     }
 
@@ -265,7 +265,7 @@ def test_api_posts_in_a_background_task_after_the_response(db: Session, client: 
         "/api/v1/operational-cashflows",
         json={
             "cashflow_type": "MAIN_ACCOUNT_TOPUP",
-            "transaction_date": date.today().isoformat(),
+            "transaction_date": today_local().isoformat(),
             "amount_idr": "900",
             "details": {},
         },
@@ -291,7 +291,7 @@ def test_api_response_does_not_depend_on_the_background_posting(
         "/api/v1/operational-cashflows",
         json={
             "cashflow_type": "MAIN_ACCOUNT_TOPUP",
-            "transaction_date": date.today().isoformat(),
+            "transaction_date": today_local().isoformat(),
             "amount_idr": "900",
             "details": {},
         },

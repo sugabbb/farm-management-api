@@ -1,6 +1,10 @@
 """Populate ``cash_statements`` (the bank-statement style record) from the existing transactions.
 
-This is a manual data migration, independent of the Alembic schema migrations. It derives every
+This is a manual data migration, independent of the Alembic schema migrations, for the one-off
+catch-up after ``alembic upgrade head`` or to repair drift from a manual database edit. The
+day-to-day population is ``app.scripts.sync_cash_statements`` (run nightly from cron, one month at
+a time, recorded in ``cash_statement_sync_runs``); this command instead covers the whole history and
+prints its report rather than recording it. It derives every
 real cash movement from ``operational_cashflows`` (+ payments), ``revenues`` (+ payments), the
 manual adjustments of ``main_cash_account_logs`` and the loan repayments, using the rules documented in
 ``app.features.cash_statement_service``, and brings the table in line with them:

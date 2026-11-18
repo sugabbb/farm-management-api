@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 from app.core.errors import AppError
 from app.db.models import CashStatement, Lender, Loan, LoanInstallment, MainCashAccountLog, User
 from app.features.cash_statement_service import plan_sync, rebuild_cash_statements
+from app.features.common import today_local
 from app.features.loan_service import (
     LoanTerms,
     OverpaymentError,
@@ -54,7 +55,7 @@ from app.main import app
 # Lenders created for every test by the autouse fixture below: name -> id.
 LENDER: dict[str, int] = {}
 
-TODAY = date.today()
+TODAY = today_local()
 START = TODAY - timedelta(days=120)
 D = Decimal
 
@@ -194,7 +195,14 @@ def main_amount(db: Session) -> Decimal | None:
 
 
 def statement_rows(db: Session) -> list[tuple[str, str, Decimal, str, str]]:
-    """(date, category, amount, description, reference) in payment order."""
+    """(date, category, amount, description, reference) in payment order.
+
+    ``cash_statements`` is no longer kept current by the write itself (see
+    app.features.cash_statement_service); it is refreshed once a night instead
+    (app.scripts.sync_cash_statements). Tests stand in for that nightly job with the full rebuild
+    before reading the table, so the month of the test data never matters.
+    """
+    rebuild_cash_statements(db)
     db.expire_all()
     rows = db.scalars(
         select(CashStatement).order_by(
@@ -573,6 +581,7 @@ def test_paying_everything_pays_the_loan_off(db: Session, actor: User) -> None:
     assert loan.status == "PAID_OFF"
     assert {item.status for item in loan.installments} == {"PAID"}
     assert summarize(loan).total_outstanding == 0
+    rebuild_cash_statements(db)
     assert {row.source_payment_status for row in db.scalars(select(CashStatement))} == {"PAID"}
     with pytest.raises(AppError) as error:
         repay_loan(db, loan.id, actor, TODAY, None, None)
@@ -666,7 +675,10 @@ def test_audit_reconciles_loan_repayments(db: Session, actor: User) -> None:
     )
 
 
-def test_live_hooks_leave_nothing_for_the_statement_backfill(db: Session, actor: User) -> None:
+def test_repayments_reach_the_statement_only_once_synced(db: Session, actor: User) -> None:
+    """Repayments no longer sync cash_statements live (see app.features.cash_statement_service);
+    syncing the statement (nightly app.scripts.sync_cash_statements; here the full rebuild) is what
+    catches them all up, in one pass, whatever happened to them since."""
     loan = new_loan(db, actor)
     repay(db, actor, loan, day=TODAY - timedelta(days=2))
     voided = repay(db, actor, loan, "500000", day=TODAY - timedelta(days=1))
@@ -674,10 +686,9 @@ def test_live_hooks_leave_nothing_for_the_statement_backfill(db: Session, actor:
     void_repayment(db, loan.id, voided, actor, "Mistake")
     db.commit()
 
-    assert plan_sync(db).changed is False
-    db.execute(delete(CashStatement))
-    db.commit()
+    assert db.scalars(select(CashStatement)).all() == [], "not synced live"
     assert rebuild_cash_statements(db).plan.inserted == 2, "one row per non-voided repayment"
+    assert plan_sync(db).changed is False, "re-running it changes nothing"
 
 
 def test_constraints(db: Session, actor: User) -> None:
@@ -795,6 +806,11 @@ def test_api_loan_lifecycle(db: Session, client: TestClient) -> None:
     assert account["current_amount"] == f"-{first_due}"
     logs = client.get("/api/v1/main-cash-account/logs", params={"source": "loan_repayments"}).json()
     assert [item["source"]["type"] for item in logs["data"]] == ["loan_repayments"]
+
+    # cash_statements is refreshed once a night (app.scripts.sync_cash_statements), not live.
+    empty = client.get("/api/v1/cash-statements", params={"reference": f"loans:{loan_id}"}).json()
+    assert empty["data"] == []
+    rebuild_cash_statements(db)
     statements = client.get("/api/v1/cash-statements", params={"reference": f"loans:{loan_id}"}).json()
     assert [(row["category"], row["debit"]) for row in statements["data"]] == [("LOAN_REPAYMENT", first_due)]
     assert client.get("/api/v1/cash-statements", params={"source_table": "loans"}).json()["meta"]["total"] == 1

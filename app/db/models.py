@@ -260,6 +260,8 @@ class OperationalCashflow(TimestampMixin, Base):
             "id",
             postgresql_where=text("cashflow_type = 'MAIN_ACCOUNT_TOPUP'"),
         ),
+        # Lets the nightly cash statement sync find the cashflows changed during a month.
+        Index("ix_operational_cashflows_updated_at", "updated_at"),
     )
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     cashflow_type: Mapped[str] = mapped_column(String(40), index=True)
@@ -359,6 +361,8 @@ class OperationalCashflowBankAdminDetail(_OpDetailMixin, Base):
 class OperationalCashflowPayment(TimestampMixin, Base):
     __tablename__ = "operational_cashflow_payments"
     __table_args__ = (
+        # Lets the nightly cash statement sync find the payments recorded/voided during a month.
+        Index("ix_operational_cashflow_payments_updated_at", "updated_at"),
         CheckConstraint("payment_mode IN ('PARTIAL','FULL')", name="mode"),
         CheckConstraint("amount_idr >= 0", name="amount"),
         CheckConstraint(
@@ -494,6 +498,48 @@ class MainCashAccountAuditRun(Base):
     error: Mapped[str | None] = mapped_column(Text)
 
 
+class CashStatementSyncRun(Base):
+    """One execution of the nightly cash statement sync (see app/scripts/sync_cash_statements.py).
+
+    History for maintainers only (no API): read it straight from the database, e.g. to check that
+    every night ran, what each run changed, or why one failed. Written in its own transaction
+    before the sync starts (``RUNNING``) and updated when it ends, so a failed run is kept too.
+    A row left in ``RUNNING`` means the process died mid-run.
+    """
+
+    __tablename__ = "cash_statement_sync_runs"
+    __table_args__ = (
+        CheckConstraint("status IN ('RUNNING','SUCCESS','FAILED')", name="status"),
+        CheckConstraint("period_end >= period_start", name="period"),
+        Index("ix_cash_statement_sync_runs_period", "period_start", "started_at"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    # The calendar month synced (first and last day, in APP_TIMEZONE).
+    period_start: Mapped[date] = mapped_column(Date)
+    period_end: Mapped[date] = mapped_column(Date)
+    # Source changes made from this moment on were in scope (the month plus a one-day overlap).
+    changed_since: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    dry_run: Mapped[bool] = mapped_column(Boolean, default=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Source transactions re-derived, per source table and in total.
+    cashflows_checked: Mapped[int] = mapped_column(Integer, default=0)
+    revenues_checked: Mapped[int] = mapped_column(Integer, default=0)
+    adjustments_checked: Mapped[int] = mapped_column(Integer, default=0)
+    loans_checked: Mapped[int] = mapped_column(Integer, default=0)
+    transactions_checked: Mapped[int] = mapped_column(Integer, default=0)
+    # Statement rows written (for a dry run: that would have been written).
+    rows_inserted: Mapped[int] = mapped_column(Integer, default=0)
+    rows_updated: Mapped[int] = mapped_column(Integer, default=0)
+    rows_deleted: Mapped[int] = mapped_column(Integer, default=0)
+    # The month's statement once synced: row count and money in/out.
+    period_rows: Mapped[int] = mapped_column(Integer, default=0)
+    period_credit: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    period_debit: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    error: Mapped[str | None] = mapped_column(Text)
+
+
 class CashStatement(TimestampMixin, Base):
     """One real cash movement of the business, bank-statement style (see cash_statement_service).
 
@@ -576,6 +622,8 @@ class Revenue(TimestampMixin, Base):
             "id",
             postgresql_where=text("revenue_type = 'MAIN_ACCOUNT_TRANSFER'"),
         ),
+        # Lets the nightly cash statement sync find the revenues changed during a month.
+        Index("ix_revenues_updated_at", "updated_at"),
     )
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     revenue_type: Mapped[str] = mapped_column(String(30), index=True)
@@ -658,6 +706,8 @@ class RevenueTransferDetail(TimestampMixin, Base):
 class RevenuePayment(TimestampMixin, Base):
     __tablename__ = "revenue_payments"
     __table_args__ = (
+        # Lets the nightly cash statement sync find the payments recorded/voided during a month.
+        Index("ix_revenue_payments_updated_at", "updated_at"),
         CheckConstraint("payment_mode IN ('PARTIAL','FULL')", name="mode"),
         CheckConstraint("amount_idr >= 0", name="amount"),
         CheckConstraint(
@@ -900,6 +950,162 @@ class LoanRepayment(TimestampMixin, Base):
     voided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     voided_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
     void_reason: Mapped[str | None] = mapped_column(Text)
+
+
+# --- Monthly cut-off ----------------------------------------------------------------------------
+# The month-end close for the finance team (app.features.monthly_cutoff_service), aggregated from
+# cash_statements. Every run is a new, immutable snapshot; ``is_latest`` marks the one to report
+# for a month (a re-run after late entries replaces it without losing the earlier figures).
+# Source ids in the detail tables are plain references (no foreign keys) and names are copied, so
+# a snapshot never changes after it is taken.
+
+
+class MonthlyCutoff(Base):
+    """One month-end close: its status and the month's headline figures.
+
+    Cash basis: every amount comes from money that actually moved (``cash_statements``), except
+    the opening balances entered at go-live and the loan interest/principal split, which are not
+    on the statement (see the service for how double counting is avoided).
+    """
+
+    __tablename__ = "monthly_cutoffs"
+    __table_args__ = (
+        CheckConstraint("status IN ('RUNNING','SUCCESS','FAILED')", name="status"),
+        CheckConstraint("period_end >= period_start", name="period"),
+        CheckConstraint("NOT is_latest OR status = 'SUCCESS'", name="latest"),
+        # At most one reported snapshot per month.
+        Index("uq_monthly_cutoffs_latest", "period_start", unique=True, postgresql_where=text("is_latest")),
+        Index("ix_monthly_cutoffs_period", "period_start", "started_at"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    period_start: Mapped[date] = mapped_column(Date)
+    period_end: Mapped[date] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    is_latest: Mapped[bool] = mapped_column(Boolean, default=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The cash statement sync of the month run just before aggregating.
+    sync_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("cash_statement_sync_runs.id", ondelete="SET NULL"), index=True
+    )
+    error: Mapped[str | None] = mapped_column(Text)
+    # Consistency checks that did not hold (the figures are still saved), as a list of strings.
+    warnings: Mapped[list[str]] = mapped_column(JSONB, default=list)
+
+    # Actual cash: cash_opening + opening_balances_in_period + cash_in - cash_out = cash_closing.
+    cash_opening: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    opening_balances_in_period: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    cash_in: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    cash_out: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    cash_closing: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    # Part of cash_closing that is not on the statement: financial_opening_balances up to period_end.
+    opening_balances_total: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    statement_rows: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Profit and loss (cash basis).
+    revenue: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    operating_expenses: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    other_expenses: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    finance_costs: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    net_profit: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+
+    # Loans at period_end.
+    loans_outstanding: Mapped[int] = mapped_column(Integer, default=0)
+    loan_principal_outstanding: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    loan_interest_outstanding: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    loan_overdue_amount: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    loan_principal_repaid: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    loan_interest_repaid: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+
+    # Receivables at period_end.
+    receivable_invoices: Mapped[int] = mapped_column(Integer, default=0)
+    receivables: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+    receivables_pending_verification: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
+
+
+class MonthlyCutoffCategory(Base):
+    """The month's statement rows grouped by direction, source and category."""
+
+    __tablename__ = "monthly_cutoff_categories"
+    __table_args__ = (
+        CheckConstraint("direction IN ('credit','debit')", name="direction"),
+        UniqueConstraint("cutoff_id", "direction", "source_table", "category"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    cutoff_id: Mapped[int] = mapped_column(ForeignKey("monthly_cutoffs.id", ondelete="CASCADE"))
+    direction: Mapped[str] = mapped_column(String(10))
+    source_table: Mapped[str] = mapped_column(String(40))
+    category: Mapped[str] = mapped_column(String(40))
+    rows: Mapped[int] = mapped_column(Integer)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+
+
+class MonthlyCutoffProfitLoss(Base):
+    """One line of the month's profit and loss, in report order. Amounts are positive; the section
+    says whether they add (``REVENUE``) or subtract. ``NON_PL`` lines are cash movements that are
+    not income or expense (loan principal, manual adjustments), listed so the P&L reconciles with
+    the cash movement: net_profit - loan principal + manual in - manual out = cash_in - cash_out.
+    """
+
+    __tablename__ = "monthly_cutoff_profit_loss"
+    __table_args__ = (
+        CheckConstraint(
+            "section IN ('REVENUE','OPERATING_EXPENSE','OTHER_EXPENSE','FINANCE_COST','NON_PL')", name="section"
+        ),
+        UniqueConstraint("cutoff_id", "section", "line"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    cutoff_id: Mapped[int] = mapped_column(ForeignKey("monthly_cutoffs.id", ondelete="CASCADE"))
+    position: Mapped[int] = mapped_column(Integer)
+    section: Mapped[str] = mapped_column(String(20))
+    line: Mapped[str] = mapped_column(String(40))
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+
+
+class MonthlyCutoffLoan(Base):
+    """A loan owed at period_end (or repaid during the month), as of period_end."""
+
+    __tablename__ = "monthly_cutoff_loans"
+    __table_args__ = (UniqueConstraint("cutoff_id", "loan_id"),)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    cutoff_id: Mapped[int] = mapped_column(ForeignKey("monthly_cutoffs.id", ondelete="CASCADE"))
+    loan_id: Mapped[int] = mapped_column(BigInteger)
+    lender_id: Mapped[int] = mapped_column(BigInteger)
+    lender_name: Mapped[str] = mapped_column(String(255))
+    reference_number: Mapped[str | None] = mapped_column(String(100))
+    loan_type: Mapped[str] = mapped_column(String(20))
+    start_date: Mapped[date] = mapped_column(Date)
+    maturity_date: Mapped[date] = mapped_column(Date)
+    principal_amount: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    principal_paid: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    principal_outstanding: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    interest_total: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    interest_paid: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    interest_outstanding: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    overdue_installments: Mapped[int] = mapped_column(Integer)
+    overdue_amount: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    principal_repaid_in_period: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    interest_repaid_in_period: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+
+
+class MonthlyCutoffReceivable(Base):
+    """What one customer still owed at period_end, with its age (days since the sale date)."""
+
+    __tablename__ = "monthly_cutoff_receivables"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    cutoff_id: Mapped[int] = mapped_column(ForeignKey("monthly_cutoffs.id", ondelete="CASCADE"), index=True)
+    # NULL: sales without a customer (e.g. OTHER revenue).
+    customer_id: Mapped[int | None] = mapped_column(BigInteger)
+    customer_name: Mapped[str] = mapped_column(String(255))
+    invoices: Mapped[int] = mapped_column(Integer)
+    outstanding: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    aging_0_30: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    aging_31_60: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    aging_61_90: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    aging_over_90: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+    # Direct-transfer sales still waiting for approval: paid according to the customer, not
+    # verified yet. Not part of ``outstanding`` or its aging.
+    pending_verification: Mapped[Decimal] = mapped_column(Numeric(18, 0))
 
 
 class AuditEvent(TimestampMixin, Base):

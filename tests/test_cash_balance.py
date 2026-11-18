@@ -7,7 +7,7 @@ database.
 """
 
 import os
-from datetime import date, datetime
+from datetime import datetime
 from decimal import Decimal
 
 from fastapi.testclient import TestClient
@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import OperationalCashflowBalance, User
 from app.features.cash_balance_service import CASH_ON_HAND, calculate_cash_on_hand, cash_on_hand, get_balance
+from app.features.common import today_local
 from app.features.finance_service import (
     decide_operational,
     pay_operational,
@@ -28,7 +29,7 @@ from app.main import app
 def topup(amount: Decimal) -> dict[str, object]:
     return {
         "cashflow_type": "MAIN_ACCOUNT_TOPUP",
-        "transaction_date": date.today(),
+        "transaction_date": today_local(),
         "amount_idr": amount,
         "details": {"notes": "Top up"},
     }
@@ -37,7 +38,7 @@ def topup(amount: Decimal) -> dict[str, object]:
 def utility(amount: Decimal, description: str = "Electricity bill") -> dict[str, object]:
     return {
         "cashflow_type": "UTILITY",
-        "transaction_date": date.today(),
+        "transaction_date": today_local(),
         "amount_idr": amount,
         "details": {"description": description},
     }
@@ -89,7 +90,7 @@ def test_unpaid_outflow_does_not_affect_balance_until_paid(db: Session, actor: U
     balance = get_balance(db, CASH_ON_HAND)
     assert balance.amount == Decimal("1000000"), "approval alone must not move cash on hand"
 
-    pay_operational(db, row, actor, date.today(), "FULL", None)
+    pay_operational(db, row, actor, today_local(), "FULL", None)
     db.commit()
     assert row.payment_status == "PAID"
     balance = get_balance(db, CASH_ON_HAND)
@@ -109,13 +110,13 @@ def test_partial_payment_deducts_only_the_paid_amount_and_full_payment_deducts_t
     decide_operational(db, row, actor, "APPROVED", None)
     db.commit()
 
-    pay_operational(db, row, actor, date.today(), "PARTIAL", Decimal("50000"))
+    pay_operational(db, row, actor, today_local(), "PARTIAL", Decimal("50000"))
     db.commit()
     assert row.payment_status == "PARTIALLY_PAID"
     balance = get_balance(db, CASH_ON_HAND)
     assert balance.amount == Decimal("950000"), "only the partially paid amount leaves the cash on hand"
 
-    pay_operational(db, row, actor, date.today(), "FULL", None)
+    pay_operational(db, row, actor, today_local(), "FULL", None)
     db.commit()
     assert row.payment_status == "PAID"
     balance = get_balance(db, CASH_ON_HAND)
@@ -132,7 +133,7 @@ def test_voiding_the_only_payment_restores_the_balance(db: Session, actor: User)
     db.commit()
     decide_operational(db, row, actor, "APPROVED", None)
     db.commit()
-    row = pay_operational(db, row, actor, date.today(), "FULL", None)
+    row = pay_operational(db, row, actor, today_local(), "FULL", None)
     db.commit()
     balance = get_balance(db, CASH_ON_HAND)
     assert balance.amount == Decimal("850000")
@@ -157,10 +158,10 @@ def test_each_partial_payment_voids_and_corrections_move_only_the_paid_amount(db
         db.expire_all()
         return get_balance(db, CASH_ON_HAND).amount
 
-    row = pay_operational(db, row, actor, date.today(), "PARTIAL", Decimal("100000"))
+    row = pay_operational(db, row, actor, today_local(), "PARTIAL", Decimal("100000"))
     db.commit()
     assert amount() == Decimal("900000")
-    row = pay_operational(db, row, actor, date.today(), "PARTIAL", Decimal("50000"))
+    row = pay_operational(db, row, actor, today_local(), "PARTIAL", Decimal("50000"))
     db.commit()
     assert amount() == Decimal("850000"), "each partial payment subtracts its own amount"
 
@@ -174,7 +175,7 @@ def test_each_partial_payment_voids_and_corrections_move_only_the_paid_amount(db
     db.commit()
     assert amount() == Decimal("950000")
 
-    pay_operational(db, row, actor, date.today(), "FULL", None)
+    pay_operational(db, row, actor, today_local(), "FULL", None)
     db.commit()
     assert amount() == Decimal("750000"), "the settling payment subtracts the remaining 200,000"
     recalculated, _ = calculate_cash_on_hand(db)

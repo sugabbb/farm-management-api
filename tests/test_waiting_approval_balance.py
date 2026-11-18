@@ -29,6 +29,7 @@ from app.features.cash_balance_service import (
     sync_balances,
     waiting_approval_effect,
 )
+from app.features.common import today_local
 from app.features.finance_service import (
     decide_operational,
     pay_operational,
@@ -43,7 +44,7 @@ from app.scripts.backfill_cash_on_hand import backfill_waiting_approval, main
 def topup(amount: str) -> dict[str, object]:
     return {
         "cashflow_type": "MAIN_ACCOUNT_TOPUP",
-        "transaction_date": date.today(),
+        "transaction_date": today_local(),
         "amount_idr": Decimal(amount),
         "details": {"notes": "Top up"},
     }
@@ -52,7 +53,7 @@ def topup(amount: str) -> dict[str, object]:
 def utility(amount: str, description: str = "Electricity bill") -> dict[str, object]:
     return {
         "cashflow_type": "UTILITY",
-        "transaction_date": date.today(),
+        "transaction_date": today_local(),
         "amount_idr": Decimal(amount),
         "details": {"description": description},
     }
@@ -217,7 +218,7 @@ def test_payments_do_not_touch_waiting_approval_and_approval_does_not_touch_cash
     assert cash(db) == Decimal("1000000"), "approving must not move cash on hand"
     assert waiting(db) == Decimal("0")
 
-    row = pay_operational(db, row, actor, date.today(), "FULL", None)
+    row = pay_operational(db, row, actor, today_local(), "FULL", None)
     db.commit()
     assert cash(db) == Decimal("800000")
     assert waiting(db) == Decimal("0")
@@ -234,7 +235,7 @@ def test_a_row_that_is_new_and_already_submitted_is_added(db: Session, actor: Us
     row = OperationalCashflow(
         cashflow_type="UTILITY",
         direction="OUTFLOW",
-        transaction_date=date.today(),
+        transaction_date=today_local(),
         amount_idr=Decimal("90000"),
         approval_status="SUBMITTED",
         payment_status="UNPAID",
@@ -269,7 +270,7 @@ def test_api_flow_updates_waiting_approval(db: Session, actor: User, actor_passw
         }
         payload = {
             "cashflow_type": "UTILITY",
-            "transaction_date": date.today().isoformat(),
+            "transaction_date": today_local().isoformat(),
             "amount_idr": "450000",
             "details": {"description": "Electricity bill"},
         }

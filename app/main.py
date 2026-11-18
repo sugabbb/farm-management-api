@@ -22,6 +22,7 @@ from app.features import (
     lenders,
     loans,
     main_cash_account,
+    monthly_cutoffs,
     people,
 )
 from app.features import settings as settings_feature
@@ -110,6 +111,7 @@ for feature_router in (
     cash_statements.router,
     lenders.router,
     loans.router,
+    monthly_cutoffs.router,
 ):
     app.include_router(feature_router, prefix="/api/v1")
 

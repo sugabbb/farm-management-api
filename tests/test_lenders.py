@@ -14,7 +14,7 @@ These run against the real PostgreSQL test database (see tests/conftest.py).
 
 import os
 from collections.abc import Iterator
-from datetime import date, timedelta
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
@@ -23,9 +23,11 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.db.models import AuditEvent, CashStatement, User
+from app.features.cash_statement_service import rebuild_cash_statements
+from app.features.common import today_local
 from app.main import app
 
-TODAY = date.today()
+TODAY = today_local()
 D = Decimal
 
 
@@ -281,6 +283,9 @@ def test_renaming_a_lender_updates_the_cash_statements_of_its_loans(db: Session,
 
     client.patch(f"/api/v1/lenders/{lender['id']}", json={"name": "Bank Rakyat Indonesia"})
 
+    # cash_statements picks up the rename once it is (re)synced - once a night in production (see
+    # app.scripts.sync_cash_statements), simulated here with the full rebuild.
+    rebuild_cash_statements(db)
     db.expire_all()
     row = db.scalars(select(CashStatement)).one()
     assert (row.description, row.counterparty) == (

@@ -9,8 +9,14 @@ Rules under test (see app/features/cash_statement_service.py):
   row on its transfer date;
 - MAIN_ACCOUNT_TRANSFER: only its fee, as a debit, once approved;
 - main cash account: only the manual adjustments, never the automatic top-up/transfer entries;
-- every write keeps its own rows in sync (same transaction); the backfill rebuilds the whole table
-  idempotently and repairs drift.
+- the table is **not** kept in sync by the write itself any more: a write only makes the row
+  eligible, and ``rebuild_cash_statements`` (the one-off ``app.scripts.backfill_cash_statements``)
+  is what derives/inserts/updates/deletes the statement rows, idempotently, for the whole history.
+  The nightly, month-scoped job has its own tests in tests/test_cash_statement_sync.py.
+
+Most tests below therefore call :func:`sync` (a thin wrapper around ``rebuild_cash_statements``)
+after the writes they are checking, standing in for the nightly job; a few explicitly assert that
+nothing appears *before* that call, to lock in that the write path no longer syncs live.
 
 Like the other finance tests these run against the real PostgreSQL test database (see
 tests/conftest.py), which is wiped before and after every test.
@@ -43,6 +49,7 @@ from app.db.models import (
 )
 from app.features.cash_balance_service import CASH_ON_HAND, get_balance
 from app.features.cash_statement_service import plan_sync, rebuild_cash_statements, source_totals
+from app.features.common import today_local
 from app.features.finance_service import (
     decide_operational,
     decide_revenue,
@@ -60,11 +67,18 @@ from app.features.main_cash_account_service import adjust
 from app.main import app
 from app.scripts.backfill_cash_statements import main
 
-TODAY = date.today()
+TODAY = today_local()
 YESTERDAY = TODAY - timedelta(days=1)
 TWO_DAYS_AGO = TODAY - timedelta(days=2)
 
 # --- Helpers ------------------------------------------------------------------------------------
+
+
+def sync(db: Session) -> None:
+    """Brings the statement up to date: writes no longer sync ``cash_statements`` live (see
+    app/features/cash_statement_service.py), so tests call this after the writes they want
+    reflected on the statement. The full rebuild, so the month of the test data never matters."""
+    rebuild_cash_statements(db)
 
 
 def statements(db: Session) -> list[CashStatement]:
@@ -167,6 +181,7 @@ def test_unpaid_cashflow_is_not_on_the_statement(db: Session, actor: User) -> No
     waiting = save_operational(db, utility_data("100000"), actor)
     submit_operational(db, waiting, actor)
     db.commit()
+    sync(db)
 
     assert statements(db) == []
 
@@ -174,6 +189,8 @@ def test_unpaid_cashflow_is_not_on_the_statement(db: Session, actor: User) -> No
 def test_single_full_payment_is_one_row_dated_on_the_payment(db: Session, actor: User) -> None:
     row = approved_outflow(db, actor, utility_data("300000"))
     pay(db, actor, row, YESTERDAY)
+    assert statements(db) == [], "not synced live any more"
+    sync(db)
 
     (statement,) = statements(db)
     assert lines(db) == [(YESTERDAY.isoformat(), "debit", Decimal("300000"), "Utility: Electricity")]
@@ -192,6 +209,7 @@ def test_partial_payments_are_one_row_each_with_the_same_reference(db: Session, 
     row = approved_outflow(db, actor, utility_data("300000"))
 
     pay(db, actor, row, TWO_DAYS_AGO, "100000")
+    sync(db)
     assert lines(db) == [
         (TWO_DAYS_AGO.isoformat(), "debit", Decimal("100000"), "Utility: Electricity (partial payment 1)")
     ]
@@ -199,6 +217,7 @@ def test_partial_payments_are_one_row_each_with_the_same_reference(db: Session, 
 
     pay(db, actor, row, YESTERDAY, "50000")
     pay(db, actor, row, TODAY)
+    sync(db)
 
     assert lines(db) == [
         (TWO_DAYS_AGO.isoformat(), "debit", Decimal("100000"), "Utility: Electricity (partial payment 1)"),
@@ -216,10 +235,12 @@ def test_voided_payment_leaves_the_statement_and_the_rest_is_renumbered(db: Sess
     row = approved_outflow(db, actor, utility_data("300000"))
     pay(db, actor, row, TWO_DAYS_AGO, "100000")
     pay(db, actor, row, YESTERDAY, "50000")
+    sync(db)
     second_id = statements(db)[1].id
 
     void_operational_payment(db, row, row.payments[0], actor, "Recorded twice")
     db.commit()
+    sync(db)
 
     assert lines(db) == [(YESTERDAY.isoformat(), "debit", Decimal("50000"), "Utility: Electricity (partial payment 1)")]
     assert statements(db)[0].id == second_id, "the remaining row is updated in place"
@@ -233,6 +254,7 @@ def test_correcting_a_partially_paid_cashflow_updates_its_rows(db: Session, acto
     # The amount was wrong: 150,000 is already paid, so the cashflow becomes PAID.
     row = save_operational(db, utility_data("150000"), actor, row, correction=True, reason="Wrong amount")
     db.commit()
+    sync(db)
 
     assert row.payment_status == "PAID"
     assert [item[3] for item in lines(db)] == [
@@ -246,6 +268,7 @@ def test_topups_are_not_on_the_statement(db: Session, actor: User) -> None:
     save_operational(db, topup_data("1000000"), actor)
     db.commit()
     drain()  # also posts the automatic main cash account entry, which must not appear either
+    sync(db)
 
     assert statements(db) == []
 
@@ -266,6 +289,7 @@ def test_salary_names_the_employee(db: Session, actor: User) -> None:
             },
         )
         pay(db, actor, row, TODAY)
+        sync(db)
 
         (statement,) = statements(db)
         assert (statement.description, statement.counterparty, statement.category) == (
@@ -293,6 +317,7 @@ def test_operational_debits_explain_the_cash_on_hand(db: Session, actor: User) -
     paid = approved_outflow(db, actor, utility_data("200000", "Water"))
     pay(db, actor, paid, TODAY)
     approved_outflow(db, actor, utility_data("999999", "Not paid yet"))
+    sync(db)
 
     operational = next(total for total in source_totals(db) if total.source_table == "operational_cashflows")
     assert operational.debit == Decimal("320000")
@@ -311,6 +336,7 @@ def test_cash_sale_payments_are_credits_numbered_like_cashflows(db: Session, act
     db.commit()
     pay_revenue(db, row, actor, TODAY, "FULL", None)
     db.commit()
+    sync(db)
 
     assert lines(db) == [
         (YESTERDAY.isoformat(), "credit", Decimal("50000"), "Egg sale (partial payment 1)"),
@@ -323,6 +349,7 @@ def test_cash_sale_payments_are_credits_numbered_like_cashflows(db: Session, act
 
     void_revenue_payment(db, row, row.payments[1], actor, "Wrong amount")
     db.commit()
+    sync(db)
     assert lines(db) == [(YESTERDAY.isoformat(), "credit", Decimal("50000"), "Egg sale (partial payment 1)")]
 
 
@@ -333,6 +360,7 @@ def test_direct_transfer_sale_is_credited_on_its_transfer_date_once_approved(db:
 
     decide_revenue(db, row, actor, "APPROVED", None, False)
     db.commit()
+    sync(db)
 
     assert lines(db) == [(YESTERDAY.isoformat(), "credit", Decimal("250000"), "Egg sale (direct transfer)")]
     (statement,) = statements(db)
@@ -344,6 +372,7 @@ def test_rejected_direct_transfer_is_not_on_the_statement(db: Session, actor: Us
     db.commit()
     decide_revenue(db, row, actor, "REJECTED", "Not received", False)
     db.commit()
+    sync(db)
 
     assert statements(db) == []
 
@@ -361,6 +390,7 @@ def test_only_the_fee_of_an_approved_transfer_is_on_the_statement(db: Session, a
     decide_revenue(db, row, actor, "APPROVED", None, True)
     db.commit()
     drain()
+    sync(db)
 
     assert lines(db) == [(TODAY.isoformat(), "debit", Decimal("6500"), "Main account transfer fee: Weekly deposit")]
     (fee,) = statements(db)
@@ -371,6 +401,7 @@ def test_only_the_fee_of_an_approved_transfer_is_on_the_statement(db: Session, a
 def test_transfer_without_fee_is_not_on_the_statement(db: Session, actor: User) -> None:
     approved_transfer(db, actor, "100000", "0")
     drain()
+    sync(db)
 
     assert statements(db) == []
 
@@ -386,6 +417,7 @@ def test_only_manual_adjustments_of_the_main_account_are_on_the_statement(db: Se
     debit = adjust(db, "debit", Decimal("2500"), "Bank admin fee", actor)
     db.commit()
     drain()
+    sync(db)
 
     rows = sorted(statements(db), key=lambda item: item.source_id)
     assert [(item.direction, Decimal(item.amount), item.description) for item in rows] == [
@@ -399,7 +431,10 @@ def test_only_manual_adjustments_of_the_main_account_are_on_the_statement(db: Se
     assert {(item.category, item.statement_date) for item in rows} == {("MANUAL_ADJUSTMENT", TODAY)}
 
 
-def test_live_hooks_leave_nothing_for_the_backfill(db: Session, actor: User) -> None:
+def test_writes_are_not_on_the_statement_until_the_nightly_sync_runs(db: Session, actor: User) -> None:
+    """The write path only makes rows *eligible*; nothing is written to cash_statements until
+    the statement is synced (nightly by app.scripts.sync_cash_statements; here the full rebuild) -
+    once it is, everything that happened since is caught up in a single pass."""
     cashflow = approved_outflow(db, actor, utility_data("300000"))
     pay(db, actor, cashflow, YESTERDAY, "100000")
     sale = save_revenue(db, egg_sale_data(), actor)
@@ -410,8 +445,12 @@ def test_live_hooks_leave_nothing_for_the_backfill(db: Session, actor: User) -> 
     adjust(db, "credit", Decimal("1000"), "Interest", actor)
     db.commit()
 
+    assert statements(db) == [], "not synced live"
+
+    sync(db)
+
     assert len(statements(db)) == 4
-    assert plan_sync(db).changed is False
+    assert plan_sync(db).changed is False, "re-running it changes nothing"
 
 
 # --- Backfill ------------------------------------------------------------------------------------
@@ -729,7 +768,7 @@ def test_api_statement_with_running_balance_details_and_filters(
     assert client.get("/api/v1/cash-statements", params={"source_table": "customers"}).status_code == 422
 
 
-def test_api_existing_endpoints_keep_the_statement_current(db: Session, client: TestClient) -> None:
+def test_api_writes_reach_the_statement_only_after_the_nightly_sync(db: Session, client: TestClient) -> None:
     base = "/api/v1/operational-cashflows"
     created = client.post(
         base,
@@ -757,10 +796,16 @@ def test_api_existing_endpoints_keep_the_statement_current(db: Session, client: 
         == 201
     )
 
+    # The writes above already moved cash_on_hand (kept current synchronously)...
+    assert client.get("/api/v1/operational-cashflows/cash-on-hand").json()["data"]["amount"] == "-90000"
+    # ...but cash_statements has nothing yet: it is refreshed once a night, not on every write.
+    assert client.get("/api/v1/cash-statements").json()["data"] == []
+
+    sync(db)  # stands in for the nightly app.scripts.sync_cash_statements job
+
     rows = client.get("/api/v1/cash-statements").json()["data"]
     assert sorted((row["description"], row["direction"], row["amount"]) for row in rows) == [
         ("Main account adjustment: Opening", "credit", "2000000"),
         ("Utility: Internet (final payment 2)", "debit", "60000"),
         ("Utility: Internet (partial payment 1)", "debit", "30000"),
     ]
-    assert client.get("/api/v1/operational-cashflows/cash-on-hand").json()["data"]["amount"] == "-90000"

@@ -1,5 +1,7 @@
 import os
+import time
 from collections.abc import Iterator
+from datetime import timedelta
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
@@ -13,6 +15,32 @@ if TYPE_CHECKING:
 os.environ.setdefault("DATABASE_URL", "postgresql+psycopg://postgres:postgres@127.0.0.1:5432/pondok_berkah_test")
 os.environ.setdefault("API_KEY", "test-api-key-with-at-least-24-characters")
 os.environ.setdefault("JWT_SECRET", "test-jwt-secret-with-at-least-thirty-two-characters")
+
+
+# --- Timezone: the tests run in APP_TIMEZONE ----------------------------------------------------
+# The app derives every business date in APP_TIMEZONE (app.features.common.today_local), whatever
+# the timezone of the machine. The tests take their own dates with today_local() too, and on top
+# of that this process is switched to APP_TIMEZONE, so any naive local time (date.today(),
+# datetime.now(), a library's) agrees with the app. Without it, a machine whose timezone differs
+# from APP_TIMEZONE fails date assertions for part of every day (e.g. UTC vs Asia/Jakarta between
+# 17:00 and 24:00 UTC, when Jakarta is already on the next date).
+# Done at import, before any test module computes its module-level dates.
+
+
+def use_app_timezone() -> None:
+    from datetime import datetime
+
+    from app.core.config import settings
+
+    os.environ["TZ"] = settings.app_timezone
+    if hasattr(time, "tzset"):  # POSIX; elsewhere the tests still use today_local() explicitly
+        time.tzset()
+        now = datetime.now(settings.timezone)
+        if abs(now.replace(tzinfo=None) - datetime.now()) > timedelta(minutes=1):
+            raise pytest.UsageError(f"could not switch the test process to APP_TIMEZONE={settings.app_timezone}")
+
+
+use_app_timezone()
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
@@ -35,6 +63,7 @@ def wipe_cashflow_data(db: Session) -> None:
     from app.db.models import (
         AuditEvent,
         CashStatement,
+        CashStatementSyncRun,
         Customer,
         FinancialOpeningBalance,
         Lender,
@@ -44,6 +73,7 @@ def wipe_cashflow_data(db: Session) -> None:
         MainCashAccountAuditRun,
         MainCashAccountEvent,
         MainCashAccountLog,
+        MonthlyCutoff,
         OperationalCashflow,
         OperationalCashflowBalance,
         OperationalCashflowPayment,
@@ -68,7 +98,9 @@ def wipe_cashflow_data(db: Session) -> None:
             )
         )
     )
+    db.execute(delete(MonthlyCutoff))  # details cascade
     db.execute(delete(CashStatement))
+    db.execute(delete(CashStatementSyncRun))
     db.execute(delete(LoanRepayment))
     db.execute(delete(Loan))  # installments cascade
     db.execute(delete(Lender))

@@ -31,7 +31,6 @@ from app.db.models import (
     User,
 )
 from app.features.cash_balance_service import CashflowState, sync_balances
-from app.features.cash_statement_service import CASHFLOW_SOURCE, REVENUE_SOURCE, sync_cash_statements
 from app.features.common import audit, model_snapshot, now_utc, today_local
 from app.features.farm_service import lock_balances
 from app.features.main_cash_account_service import RevenueState, enqueue_from_cashflow, enqueue_from_revenue
@@ -218,7 +217,6 @@ def save_operational(
     audit(db, row, action, actor, before=before, reason=reason)
     sync_balances(db, balances_before, row)
     enqueue_from_cashflow(db, balances_before, row, action)
-    sync_cash_statements(db, CASHFLOW_SOURCE, row.id)
     return row
 
 
@@ -314,7 +312,6 @@ def pay_operational(
         after=model_snapshot(row) | {"payment_amount_idr": str(value), "payment_date": paid_date.isoformat()},
     )
     sync_balances(db, balances_before, row)
-    sync_cash_statements(db, CASHFLOW_SOURCE, row.id)
     return row
 
 
@@ -341,7 +338,6 @@ def void_operational_payment(
     sync_payment_status(row)
     audit(db, row, "cashflow_payment_voided", actor, before=before, reason=reason)
     sync_balances(db, balances_before, row)
-    sync_cash_statements(db, CASHFLOW_SOURCE, row.id)
     return row
 
 
@@ -468,7 +464,6 @@ def save_revenue(
     action = "revenue_corrected" if correction else ("revenue_updated" if before else "revenue_created")
     audit(db, row, action, actor, before=before, reason=reason)
     enqueue_from_revenue(db, main_account_before, row, action)
-    sync_cash_statements(db, REVENUE_SOURCE, row.id)
     return row
 
 
@@ -595,7 +590,6 @@ def decide_revenue(
     action = "direct_transfer_approved" if direct else "transfer_approved"
     audit(db, row, action, actor, before=before)
     enqueue_from_revenue(db, main_account_before, row, action)
-    sync_cash_statements(db, REVENUE_SOURCE, row.id)
     return row
 
 
@@ -626,7 +620,6 @@ def pay_revenue(db: Session, row: Revenue, actor: User, paid_date: date, mode: s
         before=before,
         after=model_snapshot(row) | {"payment_amount_idr": str(value), "payment_date": paid_date.isoformat()},
     )
-    sync_cash_statements(db, REVENUE_SOURCE, row.id)
     return row
 
 
@@ -644,5 +637,4 @@ def void_revenue_payment(db: Session, row: Revenue, payment: RevenuePayment, act
     payment.voided_at, payment.voided_by, payment.void_reason = now_utc(), actor.id, reason
     sync_payment_status(row)
     audit(db, row, "revenue_payment_voided", actor, before=before, reason=reason)
-    sync_cash_statements(db, REVENUE_SOURCE, row.id)
     return row

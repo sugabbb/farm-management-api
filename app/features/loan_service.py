@@ -60,7 +60,6 @@ from sqlalchemy.orm import Session, selectinload
 from app.core.decimal import money
 from app.core.errors import conflict, not_found, validation
 from app.db.models import Lender, Loan, LoanInstallment, LoanRepayment, User
-from app.features.cash_statement_service import LOAN_SOURCE, sync_cash_statements
 from app.features.common import audit, model_snapshot, now_utc, today_local
 from app.features.farm_service import lock_balances
 from app.features.main_cash_account_service import LOAN_REPAYMENT_SOURCE, enqueue, repayment_effect
@@ -483,8 +482,8 @@ def update_loan(db: Session, loan_id: int, data: dict[str, Any], actor: User) ->
         replace_schedule(db, loan, terms)
         reallocate(loan)
     audit(db, loan, "loan_updated", actor, before=before)
-    # Lender, contract number, start date and the installments covered appear on the cash statements.
-    sync_cash_statements(db, LOAN_SOURCE, loan.id)
+    # Lender, contract number, start date and the installments covered appear on the cash
+    # statements; the nightly sync picks the change up (see app.scripts.sync_cash_statements).
     return loan
 
 
@@ -536,7 +535,6 @@ def repay_loan(
         after=model_snapshot(loan) | {"repayment": model_snapshot(repayment)},
     )
     enqueue(db, LOAN_REPAYMENT_SOURCE, repayment.id, "loan_repaid", repayment_effect(False, value))
-    sync_cash_statements(db, LOAN_SOURCE, loan.id)
     return repayment
 
 
@@ -566,7 +564,6 @@ def void_repayment(db: Session, loan_id: int, repayment_id: int, actor: User, re
     amount = Decimal(repayment.amount)
     delta = repayment_effect(True, amount) - repayment_effect(False, amount)
     enqueue(db, LOAN_REPAYMENT_SOURCE, repayment.id, "loan_repayment_voided", delta)
-    sync_cash_statements(db, LOAN_SOURCE, loan.id)
     return repayment
 
 
@@ -581,5 +578,4 @@ def cancel_loan(db: Session, loan_id: int, actor: User, reason: str) -> Loan:
     before = model_snapshot(loan)
     loan.status, loan.cancelled_at, loan.cancelled_by, loan.cancel_reason = CANCELLED, now_utc(), actor.id, reason
     audit(db, loan, "loan_cancelled", actor, before=before, reason=reason)
-    sync_cash_statements(db, LOAN_SOURCE, loan.id)
     return loan

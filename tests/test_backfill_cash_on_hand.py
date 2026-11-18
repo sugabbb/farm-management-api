@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import OperationalCashflow, OperationalCashflowBalance, OperationalCashflowPayment, User
 from app.features.cash_balance_service import CASH_ON_HAND, calculate_cash_on_hand, get_balance
+from app.features.common import today_local
 from app.features.finance_service import (
     decide_operational,
     pay_operational,
@@ -134,7 +135,7 @@ def test_backfill_agrees_with_the_live_incremental_balance(db: Session, actor: U
     def save(cashflow_type: str, amount: str, details: dict[str, object]) -> OperationalCashflow:
         data = {
             "cashflow_type": cashflow_type,
-            "transaction_date": date.today(),
+            "transaction_date": today_local(),
             "amount_idr": Decimal(amount),
             "details": details,
         }
@@ -150,13 +151,13 @@ def test_backfill_agrees_with_the_live_incremental_balance(db: Session, actor: U
     save("MAIN_ACCOUNT_TOPUP", "2000000", {"notes": "top up"})
     paid = save("UTILITY", "250000", {"description": "electricity"})
     approve(paid)
-    pay_operational(db, paid, actor, date.today(), "FULL", None)
+    pay_operational(db, paid, actor, today_local(), "FULL", None)
     partial = save("OTHER", "400000", {"description": "repairs"})
     approve(partial)
-    pay_operational(db, partial, actor, date.today(), "PARTIAL", Decimal("100000"))
+    pay_operational(db, partial, actor, today_local(), "PARTIAL", Decimal("100000"))
     voided = save("UTILITY", "75000", {"description": "water"})
     approve(voided)
-    voided = pay_operational(db, voided, actor, date.today(), "FULL", None)
+    voided = pay_operational(db, voided, actor, today_local(), "FULL", None)
     void_operational_payment(db, voided, voided.payments[0], actor, "wrong entry")
     save("UTILITY", "50000", {"description": "still unpaid"})
     db.commit()

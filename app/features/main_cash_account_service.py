@@ -205,15 +205,12 @@ def enqueue_from_revenue(
 def adjust(db: Session, direction: str, amount: Decimal, note: str, actor: User) -> MainCashAccountLog:
     """Manual credit/debit entered through the API (for example the opening balance or a bank
     fee that does not come from operational cashflows or revenues). Posted immediately; it only
-    needs the account row lock, not the cashflow/revenue write lock."""
-    # Imported here: cash_statement_service reuses this module's constants.
-    from app.features.cash_statement_service import LOG_SOURCE, sync_cash_statements
-
+    needs the account row lock, not the cashflow/revenue write lock. It reaches ``cash_statements``
+    the next time the nightly sync runs (see app.scripts.sync_cash_statements)."""
     delta = amount if direction == CREDIT else -amount
     entry = post_entry(db, delta, manual_reference(note))
     assert entry is not None
     audit(db, entry, "main_cash_account_adjusted", actor, reason=note)
-    sync_cash_statements(db, LOG_SOURCE, entry.id)
     return entry
 
 
